@@ -96,22 +96,22 @@ impl<'n> TreeNodeVisitor<'n> for Visitor {
 }
 
 fn criterion_benchmark(c: &mut Criterion) {
-    let width = 10;
+    let width = 2;
 
     let mut group = c.benchmark_group(format!("Visit Tree width={:}", width));
     let plot_config = PlotConfiguration::default().summary_scale(AxisScale::Logarithmic);
 
     group.plot_config(plot_config);
 
-    for height in [2, 3, 4, 5, 6].iter() {
-        group.bench_with_input(BenchmarkId::new("Recursive", height), height, |b, h| {
+    for height in 1..=25 {
+        group.bench_with_input(BenchmarkId::new("Recursive", height), &height, |b, h| {
             let mut visitor = Visitor::new(0);
             let tree = make_tree(width, *h);
 
             b.iter(|| tree.visit(&mut visitor))
         });
 
-        group.bench_with_input(BenchmarkId::new("Iterative", height), height, |b, h| {
+        group.bench_with_input(BenchmarkId::new("Iterative", height), &height, |b, h| {
             let mut visitor = Visitor::new(0);
             let tree = make_tree(width, *h);
             b.iter(|| tree.visit_iterative(&mut visitor))
