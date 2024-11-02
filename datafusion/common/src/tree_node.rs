@@ -18,9 +18,9 @@
 //! [`TreeNode`] for visiting and rewriting expression and plan trees
 
 use crate::Result;
+use recursive::recursive;
 use std::marker::PhantomData;
 use std::sync::Arc;
-use recursive::recursive;
 
 /// These macros are used to determine continuation during transforming traversals.
 macro_rules! handle_transform_recursion {
@@ -961,6 +961,76 @@ pub trait RecursiveNode: Sized {
 
     /// Replaces children with the given one
     fn with_new_children(self, children: Vec<Self>) -> Result<Self>;
+
+    fn visit_iterative<'n, V: TreeNodeVisitor<'n, Node = Self>>(
+        &'n self,
+        visitor: &mut V,
+    ) -> Result<TreeNodeRecursion> {
+        let mut stack = vec![VisitingState::NotStarted(self)];
+
+        while let Some(node) = stack.last_mut() {
+            match node {
+                VisitingState::NotStarted(item) => {
+                    let tnr = visitor.f_down(item)?;
+                    *node = match tnr {
+                        TreeNodeRecursion::Continue => {
+                            let mut non_processed_children = item.children();
+                            non_processed_children.reverse();
+
+                            VisitingState::VisitingChildren {
+                                non_processed_children,
+                                item,
+                                tnr,
+                            }
+                        }
+                        TreeNodeRecursion::Jump => VisitingState::VisitedAllChildren {
+                            item,
+                            tnr: TreeNodeRecursion::Continue,
+                        },
+                        TreeNodeRecursion::Stop => return Ok(tnr),
+                    };
+                }
+                VisitingState::VisitingChildren {
+                    item,
+                    ref mut non_processed_children,
+                    tnr,
+                } => match tnr {
+                    TreeNodeRecursion::Continue | TreeNodeRecursion::Jump => {
+                        if let Some(non_processed_item) = non_processed_children.pop() {
+                            stack.push(VisitingState::NotStarted(non_processed_item));
+                        } else {
+                            *node = VisitingState::VisitedAllChildren { item, tnr: *tnr }
+                        }
+                    }
+                    TreeNodeRecursion::Stop => {
+                        return Ok(*tnr);
+                    }
+                },
+                VisitingState::VisitedAllChildren { item, tnr } => {
+                    let tnr = tnr.visit_parent(|| visitor.f_up(item))?;
+                    stack.pop();
+
+                    if let Some(VisitingState::VisitingChildren {
+                                    item,
+                                    non_processed_children,
+                                    .. // we don't care about the parent recursion state, because it will be replaced with the current state anyway
+                                }) = stack.pop()
+                    {
+                        stack.push(VisitingState::VisitingChildren {
+                            item,
+                            non_processed_children,
+                            tnr,
+                        });
+                    } else {
+                        debug_assert!(stack.is_empty());
+                        return Ok(tnr);
+                    }
+                }
+            }
+        }
+
+        unreachable!()
+    }
 }
 
 impl<T: RecursiveNode> Transformed<T> {
@@ -1179,76 +1249,6 @@ impl<T: RecursiveNode> TreeNode for T {
         }
 
         unreachable!();
-    }
-
-    fn visit<'n, V: TreeNodeVisitor<'n, Node = Self>>(
-        &'n self,
-        visitor: &mut V,
-    ) -> Result<TreeNodeRecursion> {
-        let mut stack = vec![VisitingState::NotStarted(self)];
-
-        while let Some(node) = stack.last_mut() {
-            match node {
-                VisitingState::NotStarted(item) => {
-                    let tnr = visitor.f_down(item)?;
-                    *node = match tnr {
-                        TreeNodeRecursion::Continue => {
-                            let mut non_processed_children = item.children();
-                            non_processed_children.reverse();
-
-                            VisitingState::VisitingChildren {
-                                non_processed_children,
-                                item,
-                                tnr,
-                            }
-                        }
-                        TreeNodeRecursion::Jump => VisitingState::VisitedAllChildren {
-                            item,
-                            tnr: TreeNodeRecursion::Continue,
-                        },
-                        TreeNodeRecursion::Stop => return Ok(tnr),
-                    };
-                }
-                VisitingState::VisitingChildren {
-                    item,
-                    ref mut non_processed_children,
-                    tnr,
-                } => match tnr {
-                    TreeNodeRecursion::Continue | TreeNodeRecursion::Jump => {
-                        if let Some(non_processed_item) = non_processed_children.pop() {
-                            stack.push(VisitingState::NotStarted(non_processed_item));
-                        } else {
-                            *node = VisitingState::VisitedAllChildren { item, tnr: *tnr }
-                        }
-                    }
-                    TreeNodeRecursion::Stop => {
-                        return Ok(*tnr);
-                    }
-                },
-                VisitingState::VisitedAllChildren { item, tnr } => {
-                    let tnr = tnr.visit_parent(|| visitor.f_up(item))?;
-                    stack.pop();
-
-                    if let Some(VisitingState::VisitingChildren {
-                                    item,
-                                    non_processed_children,
-                                    .. // we don't care about the parent recursion state, because it will be replaced with the current state anyway
-                                }) = stack.pop()
-                    {
-                        stack.push(VisitingState::VisitingChildren {
-                            item,
-                            non_processed_children,
-                            tnr,
-                        });
-                    } else {
-                        debug_assert!(stack.is_empty());
-                        return Ok(tnr);
-                    }
-                }
-            }
-        }
-
-        unreachable!()
     }
 }
 
@@ -2653,8 +2653,7 @@ pub(crate) mod tests {
     fn test_large_tree() {
         let mut item = TestTreeNode::new_leaf("initial".to_string());
         for i in 0..3000 {
-            item =
-                TestTreeNode::new(vec![item], format!("parent-{}", i));
+            item = TestTreeNode::new(vec![item], format!("parent-{}", i));
         }
 
         let mut visitor =

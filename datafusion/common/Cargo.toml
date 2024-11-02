@@ -54,6 +54,7 @@ arrow-array = { workspace = true }
 arrow-buffer = { workspace = true }
 arrow-schema = { workspace = true }
 chrono = { workspace = true }
+criterion = { version = "0.5", features = ["async_tokio"] }
 half = { workspace = true }
 hashbrown = { workspace = true }
 indexmap = { workspace = true }
@@ -72,3 +73,7 @@ instant = { version = "0.1", features = ["wasm-bindgen"] }
 
 [dev-dependencies]
 rand = { workspace = true }
+
+[[bench]]
+harness = false
+name = "tree_node"
