@@ -20,7 +20,7 @@ extern crate arrow;
 extern crate criterion;
 
 use crate::criterion::Criterion;
-use criterion::{AxisScale, BenchmarkId, PlotConfiguration, Throughput};
+use criterion::{black_box, AxisScale, BenchmarkId, PlotConfiguration, Throughput};
 use datafusion_common::tree_node::{
     DynTreeNode, RecursiveNode, TreeNode, TreeNodeRecursion, TreeNodeVisitor,
 };
@@ -104,17 +104,17 @@ fn criterion_benchmark(c: &mut Criterion) {
     group.plot_config(plot_config);
 
     for height in 1..=25 {
-        group.bench_with_input(BenchmarkId::new("Recursive", height), &height, |b, h| {
-            let mut visitor = Visitor::new(0);
-            let tree = make_tree(width, *h);
-
-            b.iter(|| tree.visit(&mut visitor))
-        });
-
         group.bench_with_input(BenchmarkId::new("Iterative", height), &height, |b, h| {
             let mut visitor = Visitor::new(0);
-            let tree = make_tree(width, *h);
-            b.iter(|| tree.visit_iterative(&mut visitor))
+            let tree = make_tree(width, black_box(*h));
+            b.iter(|| tree.visit_iterative(black_box(&mut visitor)))
+        });
+
+        group.bench_with_input(BenchmarkId::new("Recursive", height), &height, |b, h| {
+            let mut visitor = Visitor::new(0);
+            let tree = make_tree(width, black_box(*h));
+
+            b.iter(|| tree.visit(black_box(&mut visitor)))
         });
     }
 }
