@@ -232,7 +232,7 @@ jobs:
 
   # Run integration tests for datafusion-cli
   datafusion-cli-integration:
-    name: cargo test doc (amd64)
+    name: datafusion-cli integration tests (amd64)
     needs: [ linux-build-lib ]
     runs-on: ubuntu-latest
     container:
