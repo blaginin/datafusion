@@ -189,6 +189,8 @@ jobs:
           rust-version: stable
       - name: Setup S3-compatible storage
         run:
+          pip install -U pip
+          pip install awscli
           aws s3 mb s3://datafusion --endpoint-url=$AWS_ENDPOINT
           aws s3 cp ../datafusion/core/tests/data/cars.csv s3://datafusion/cars.csv --endpoint-url=$AWS_ENDPOINT
       - name: Run tests (excluding doctests, but with integration tests)
