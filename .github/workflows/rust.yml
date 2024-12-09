@@ -175,10 +175,10 @@ jobs:
         minio:
             image: quay.io/minio/minio
             env:
-            - MINIO_ROOT_USER: DataFusion-Test-Login
-            - MINIO_ROOT_PASSWORD: DataFusion-Test-Password
+              MINIO_ROOT_USER: DataFusion-Test-Login
+              MINIO_ROOT_PASSWORD: DataFusion-Test-Password
             ports:
-            - 9000:9000
+              - 9000:9000
     steps:
       - uses: actions/checkout@v4
         with:
