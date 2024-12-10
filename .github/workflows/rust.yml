@@ -167,8 +167,8 @@ jobs:
     runs-on: ubuntu-latest
     env:
       AWS_ENDPOINT: http://localhost:9000
-      AWS_ACCESS_KEY_ID: DataFusion-Test-Login
-      AWS_SECRET_ACCESS_KEY: DataFusion-Test-Password
+      AWS_ACCESS_KEY_ID: DataFusionLogin
+      AWS_SECRET_ACCESS_KEY: DataFusionPassword
     steps:
       - uses: actions/checkout@v4
         with:
@@ -180,7 +180,7 @@ jobs:
       - name: Setup S3-compatible storage
         working-directory: datafusion-cli
         run: |
-          echo "MINIO_CONTAINER=$(docker run -d -p 9000:9000 -e MINIO_ROOT_USER=DataFusion-Test-Login -e MINIO_ROOT_PASSWORD=DataFusion-Test-Password quay.io/minio/minio server /data)" >> $GITHUB_ENV
+          echo "MINIO_CONTAINER=$(docker run -d -p 9000:9000 -e MINIO_ROOT_USER=DataFusionLogin -e MINIO_ROOT_PASSWORD=DataFusionPassword quay.io/minio/minio server /data)" >> $GITHUB_ENV
           aws s3 mb s3://datafusion --endpoint-url=$AWS_ENDPOINT
           aws s3 cp ../datafusion/core/tests/data/cars.csv s3://datafusion/cars.csv --endpoint-url=$AWS_ENDPOINT
 
