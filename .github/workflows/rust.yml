@@ -179,7 +179,7 @@ jobs:
           rustup default stable
       - name: Setup S3-compatible storage
         run:
-          echo "MINIO_CONTAINER=$(docker run -p 9000:9000 -e MINIO_ROOT_USER=DataFusion-Test-Login -e MINIO_ROOT_PASSWORD=DataFusion-Test-Password quay.io/minio/minio server /data)" >> $GITHUB_ENV
+          echo "MINIO_CONTAINER=$(docker run -d -p 9000:9000 -e MINIO_ROOT_USER=DataFusion-Test-Login -e MINIO_ROOT_PASSWORD=DataFusion-Test-Password quay.io/minio/minio server /data)" >> $GITHUB_ENV
           aws s3 mb s3://datafusion --endpoint-url=$AWS_ENDPOINT
           aws s3 cp ../datafusion/core/tests/data/cars.csv s3://datafusion/cars.csv --endpoint-url=$AWS_ENDPOINT
 
