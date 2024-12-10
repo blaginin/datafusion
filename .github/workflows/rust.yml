@@ -163,7 +163,7 @@ jobs:
 
   linux-test-datafusion-cli:
     name: cargo test datafusion-cli (amd64)
-    needs: [ linux-build-lib ]
+#    needs: [ linux-build-lib ] todo
     runs-on: ubuntu-latest
     env:
       AWS_ENDPOINT: http://localhost:9000
