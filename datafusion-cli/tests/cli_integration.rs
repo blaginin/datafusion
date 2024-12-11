@@ -140,7 +140,7 @@ async fn create_bucket(bucket_name: &str, aws_client: &aws_sdk_s3::Client) {
                 .await
                 .expect("Failed to create bucket");
         }
-        Err(e) => panic!("Failed to head bucket: {:?}", e),
+        Err(e) => panic!("Failed to head bucket: {:?}", e.raw_response().unwrap().body()),
     }
 }
 
