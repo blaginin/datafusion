@@ -50,7 +50,7 @@ To test the S3 integration against [Minio](https://github.com/minio/minio)
 First start up a container with Minio and load test files.
 
 ```shell
-docker run -d \
+docker run \
   --name minio-container \
   -p 9000:9000 \
   -e MINIO_ROOT_USER=TEST-DataFusionLogin \
