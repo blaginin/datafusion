@@ -214,7 +214,7 @@ jobs:
         run: |
           docker run -d --name minio-container -p 9000:9000 -e MINIO_ROOT_USER=TEST-DataFusionLogin -e MINIO_ROOT_PASSWORD=TEST-DataFusionPassword quay.io/minio/minio -v $(pwd)/../datafusion/core/tests/data:/source server /data
           docker exec minio-container /bin/sh -c "\
-            while !curl -I http://minio:9000/minio/health/live; do echo 'Wait minio to startup...' && sleep 1; done; sleep 1;
+            while ! curl -I http://minio:9000/minio/health/live; do echo 'Wait minio to startup...' && sleep 1; done; sleep 1;
             mc alias set localminio http://localhost:9000 TEST-DataFusionLogin TEST-DataFusionPassword && \
             mc mb localminio/data && \
             mc cp -r /source/* localminio/data"
