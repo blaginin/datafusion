@@ -50,15 +50,15 @@ To test the S3 integration against [Minio](https://github.com/minio/minio)
 First start up a container with Minio and load test files.
 
 ```shell
-docker run \
-  --name minio-container \
+docker run -d \
+  --name datafusion-test-minio \
   -p 9000:9000 \
   -e MINIO_ROOT_USER=TEST-DataFusionLogin \
   -e MINIO_ROOT_PASSWORD=TEST-DataFusionPassword \
   -v $(pwd)/../datafusion/core/tests/data:/source \
   quay.io/minio/minio server /data
 
-docker exec minio-container /bin/sh -c "\
+docker exec datafusion-test-minio /bin/sh -c "\
   mc alias set localminio http://localhost:9000 TEST-DataFusionLogin TEST-DataFusionPassword && \
   mc mb localminio/data && \
   mc cp -r /source/* localminio/data"

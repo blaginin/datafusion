@@ -126,7 +126,7 @@ async fn test_aws_options() {
     let input = format!(
         r#"CREATE EXTERNAL TABLE CARS
 STORED AS CSV
-LOCATION 's3://options/cars.csv'
+LOCATION 's3://data/cars.csv'
 OPTIONS(
     'aws.access_key_id' '{}',
     'aws.secret_access_key' '{}',
