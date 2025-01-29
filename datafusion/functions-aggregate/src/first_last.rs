@@ -18,13 +18,17 @@
 //! Defines the FIRST_VALUE/LAST_VALUE aggregations.
 
 use std::any::Any;
+use std::cmp::Ordering;
 use std::fmt::Debug;
 use std::mem::size_of_val;
 use std::sync::Arc;
 
-use arrow::array::{ArrayRef, AsArray, BooleanArray};
-use arrow::compute::{self, lexsort_to_indices, take_arrays, SortColumn};
+use arrow::array::{Array, ArrayRef, AsArray, BooleanArray};
+use arrow::compute::{
+    self, lexsort_to_indices, take_arrays, LexicographicalComparator, SortColumn,
+};
 use arrow::datatypes::{DataType, Field};
+use arrow::row::{RowConverter, SortField};
 use datafusion_common::utils::{compare_rows, get_row_at_idx};
 use datafusion_common::{
     arrow_datafusion_err, internal_err, DataFusionError, Result, ScalarValue,
@@ -133,11 +137,12 @@ impl AggregateUDFImpl for FirstValue {
         let requirement_satisfied =
             acc_args.ordering_req.is_empty() || self.requirement_satisfied;
 
-        FirstValueAccumulator::try_new(
+        FirstLastAccumulator::try_new(
             acc_args.return_type,
             &ordering_dtypes,
             acc_args.ordering_req.clone(),
             acc_args.ignore_nulls,
+            Ordering::Less,
         )
         .map(|acc| Box::new(acc.with_requirement_satisfied(requirement_satisfied)) as _)
     }
@@ -176,183 +181,6 @@ impl AggregateUDFImpl for FirstValue {
 
     fn documentation(&self) -> Option<&Documentation> {
         self.doc()
-    }
-}
-
-#[derive(Debug)]
-pub struct FirstValueAccumulator {
-    first: ScalarValue,
-    // At the beginning, `is_set` is false, which means `first` is not seen yet.
-    // Once we see the first value, we set the `is_set` flag and do not update `first` anymore.
-    is_set: bool,
-    // Stores ordering values, of the aggregator requirement corresponding to first value
-    // of the aggregator. These values are used during merging of multiple partitions.
-    orderings: Vec<ScalarValue>,
-    // Stores the applicable ordering requirement.
-    ordering_req: LexOrdering,
-    // Stores whether incoming data already satisfies the ordering requirement.
-    requirement_satisfied: bool,
-    // Ignore null values.
-    ignore_nulls: bool,
-}
-
-impl FirstValueAccumulator {
-    /// Creates a new `FirstValueAccumulator` for the given `data_type`.
-    pub fn try_new(
-        data_type: &DataType,
-        ordering_dtypes: &[DataType],
-        ordering_req: LexOrdering,
-        ignore_nulls: bool,
-    ) -> Result<Self> {
-        let orderings = ordering_dtypes
-            .iter()
-            .map(ScalarValue::try_from)
-            .collect::<Result<Vec<_>>>()?;
-        let requirement_satisfied = ordering_req.is_empty();
-        ScalarValue::try_from(data_type).map(|first| Self {
-            first,
-            is_set: false,
-            orderings,
-            ordering_req,
-            requirement_satisfied,
-            ignore_nulls,
-        })
-    }
-
-    pub fn with_requirement_satisfied(mut self, requirement_satisfied: bool) -> Self {
-        self.requirement_satisfied = requirement_satisfied;
-        self
-    }
-
-    // Updates state with the values in the given row.
-    fn update_with_new_row(&mut self, row: &[ScalarValue]) {
-        self.first = row[0].clone();
-        self.orderings = row[1..].to_vec();
-        self.is_set = true;
-    }
-
-    fn get_first_idx(&self, values: &[ArrayRef]) -> Result<Option<usize>> {
-        let [value, ordering_values @ ..] = values else {
-            return internal_err!("Empty row in FIRST_VALUE");
-        };
-        if self.requirement_satisfied {
-            // Get first entry according to the pre-existing ordering (0th index):
-            if self.ignore_nulls {
-                // If ignoring nulls, find the first non-null value.
-                for i in 0..value.len() {
-                    if !value.is_null(i) {
-                        return Ok(Some(i));
-                    }
-                }
-                return Ok(None);
-            } else {
-                // If not ignoring nulls, return the first value if it exists.
-                return Ok((!value.is_empty()).then_some(0));
-            }
-        }
-        let sort_columns = ordering_values
-            .iter()
-            .zip(self.ordering_req.iter())
-            .map(|(values, req)| SortColumn {
-                values: Arc::clone(values),
-                options: Some(req.options),
-            })
-            .collect::<Vec<_>>();
-
-        if self.ignore_nulls {
-            let indices = lexsort_to_indices(&sort_columns, None)?;
-            // If ignoring nulls, find the first non-null value.
-            for index in indices.iter().flatten() {
-                if !value.is_null(index as usize) {
-                    return Ok(Some(index as usize));
-                }
-            }
-            Ok(None)
-        } else {
-            let indices = lexsort_to_indices(&sort_columns, Some(1))?;
-            Ok((!indices.is_empty()).then_some(indices.value(0) as _))
-        }
-    }
-}
-
-impl Accumulator for FirstValueAccumulator {
-    fn state(&mut self) -> Result<Vec<ScalarValue>> {
-        let mut result = vec![self.first.clone()];
-        result.extend(self.orderings.iter().cloned());
-        result.push(ScalarValue::Boolean(Some(self.is_set)));
-        Ok(result)
-    }
-
-    fn update_batch(&mut self, values: &[ArrayRef]) -> Result<()> {
-        if !self.is_set {
-            if let Some(first_idx) = self.get_first_idx(values)? {
-                let row = get_row_at_idx(values, first_idx)?;
-                self.update_with_new_row(&row);
-            }
-        } else if !self.requirement_satisfied {
-            if let Some(first_idx) = self.get_first_idx(values)? {
-                let row = get_row_at_idx(values, first_idx)?;
-                let orderings = &row[1..];
-                if compare_rows(
-                    &self.orderings,
-                    orderings,
-                    &get_sort_options(self.ordering_req.as_ref()),
-                )?
-                .is_gt()
-                {
-                    self.update_with_new_row(&row);
-                }
-            }
-        }
-        Ok(())
-    }
-
-    fn merge_batch(&mut self, states: &[ArrayRef]) -> Result<()> {
-        // FIRST_VALUE(first1, first2, first3, ...)
-        // last index contains is_set flag.
-        let is_set_idx = states.len() - 1;
-        let flags = states[is_set_idx].as_boolean();
-        let filtered_states = filter_states_according_to_is_set(states, flags)?;
-        // 1..is_set_idx range corresponds to ordering section
-        let sort_cols = convert_to_sort_cols(
-            &filtered_states[1..is_set_idx],
-            self.ordering_req.as_ref(),
-        );
-
-        let ordered_states = if sort_cols.is_empty() {
-            // When no ordering is given, use the existing state as is:
-            filtered_states
-        } else {
-            let indices = lexsort_to_indices(&sort_cols, None)?;
-            take_arrays(&filtered_states, &indices, None)?
-        };
-        if !ordered_states[0].is_empty() {
-            let first_row = get_row_at_idx(&ordered_states, 0)?;
-            // When collecting orderings, we exclude the is_set flag from the state.
-            let first_ordering = &first_row[1..is_set_idx];
-            let sort_options = get_sort_options(self.ordering_req.as_ref());
-            // Either there is no existing value, or there is an earlier version in new data.
-            if !self.is_set
-                || compare_rows(&self.orderings, first_ordering, &sort_options)?.is_gt()
-            {
-                // Update with first value in the state. Note that we should exclude the
-                // is_set flag from the state. Otherwise, we will end up with a state
-                // containing two is_set flags.
-                self.update_with_new_row(&first_row[0..is_set_idx]);
-            }
-        }
-        Ok(())
-    }
-
-    fn evaluate(&mut self) -> Result<ScalarValue> {
-        Ok(self.first.clone())
-    }
-
-    fn size(&self) -> usize {
-        size_of_val(self) - size_of_val(&self.first)
-            + self.first.size()
-            + ScalarValue::size_of_vec(&self.orderings)
-            - size_of_val(&self.orderings)
     }
 }
 
@@ -439,11 +267,12 @@ impl AggregateUDFImpl for LastValue {
         let requirement_satisfied =
             acc_args.ordering_req.is_empty() || self.requirement_satisfied;
 
-        LastValueAccumulator::try_new(
+        FirstLastAccumulator::try_new(
             acc_args.return_type,
             &ordering_dtypes,
             acc_args.ordering_req.clone(),
             acc_args.ignore_nulls,
+            Ordering::Greater,
         )
         .map(|acc| Box::new(acc.with_requirement_satisfied(requirement_satisfied)) as _)
     }
@@ -493,183 +322,236 @@ impl AggregateUDFImpl for LastValue {
 }
 
 #[derive(Debug)]
-struct LastValueAccumulator {
-    last: ScalarValue,
-    // The `is_set` flag keeps track of whether the last value is finalized.
-    // This information is used to discriminate genuine NULLs and NULLS that
-    // occur due to empty partitions.
-    is_set: bool,
+struct FirstLastAccumulator {
+    value: ScalarValue,
+
+    // At the beginning, `is_set` is false, which means `first` is not seen yet.
+    // Once we see the first value, we set the `is_set` flag and do not update `first` anymore.
+    is_set: bool, // todo: kill is_set
+
+    // Stores whether incoming data already satisfies the ordering requirement.
+    requirement_satisfied: bool,
+
+    // Stores ordering values, of the aggregator requirement corresponding to first value
+    // of the aggregator. These values are used during merging of multiple partitions.
     orderings: Vec<ScalarValue>,
     // Stores the applicable ordering requirement.
     ordering_req: LexOrdering,
-    // Stores whether incoming data already satisfies the ordering requirement.
-    requirement_satisfied: bool,
     // Ignore null values.
     ignore_nulls: bool,
+
+    target: Ordering,
+
+    potentially_sortfields: Vec<SortField>,
 }
 
-impl LastValueAccumulator {
-    /// Creates a new `LastValueAccumulator` for the given `data_type`.
+impl FirstLastAccumulator {
     pub fn try_new(
         data_type: &DataType,
         ordering_dtypes: &[DataType],
         ordering_req: LexOrdering,
         ignore_nulls: bool,
+        target: Ordering,
     ) -> Result<Self> {
         let orderings = ordering_dtypes
             .iter()
             .map(ScalarValue::try_from)
             .collect::<Result<Vec<_>>>()?;
         let requirement_satisfied = ordering_req.is_empty();
-        ScalarValue::try_from(data_type).map(|last| Self {
-            last,
+
+        let fields: Vec<_> = ordering_dtypes
+            .iter()
+            .map(|a| SortField::new(a.clone()))
+            .collect();
+
+        ScalarValue::try_from(data_type).map(|value| Self {
+            value,
             is_set: false,
             orderings,
             ordering_req,
             requirement_satisfied,
             ignore_nulls,
+            potentially_sortfields: fields,
+            target,
         })
+    }
+
+    pub fn with_requirement_satisfied(mut self, requirement_satisfied: bool) -> Self {
+        self.requirement_satisfied = requirement_satisfied;
+        self
     }
 
     // Updates state with the values in the given row.
     fn update_with_new_row(&mut self, row: &[ScalarValue]) {
-        self.last = row[0].clone();
+        self.value = row[0].clone();
         self.orderings = row[1..].to_vec();
         self.is_set = true;
     }
 
-    fn get_last_idx(&self, values: &[ArrayRef]) -> Result<Option<usize>> {
+    fn get_first_idx(&self, values: &[ArrayRef]) -> Result<Option<usize>> {
+        // todo: it's enough to do max(current, MAX(buffer))!
         let [value, ordering_values @ ..] = values else {
-            return internal_err!("Empty row in LAST_VALUE");
+            return internal_err!("Empty row in FIRST_VALUE");
         };
         if self.requirement_satisfied {
-            // Get last entry according to the order of data:
+            // Get first entry according to the pre-existing ordering (0th index):
             if self.ignore_nulls {
-                // If ignoring nulls, find the last non-null value.
-                for i in (0..value.len()).rev() {
+                // If ignoring nulls, find the first non-null value.
+                for i in 0..value.len() {
                     if !value.is_null(i) {
                         return Ok(Some(i));
                     }
                 }
                 return Ok(None);
             } else {
-                return Ok((!value.is_empty()).then_some(value.len() - 1));
+                // If not ignoring nulls, return the first value if it exists.
+                return Ok((!value.is_empty()).then_some(0));
             }
         }
         let sort_columns = ordering_values
             .iter()
             .zip(self.ordering_req.iter())
-            .map(|(values, req)| {
-                // Take the reverse ordering requirement. This enables us to
-                // use "fetch = 1" to get the last value.
-                SortColumn {
-                    values: Arc::clone(values),
-                    options: Some(!req.options),
-                }
+            .map(|(values, req)| SortColumn {
+                values: Arc::clone(values),
+                options: Some(req.options),
             })
             .collect::<Vec<_>>();
 
-        if self.ignore_nulls {
-            let indices = lexsort_to_indices(&sort_columns, None)?;
-            // If ignoring nulls, find the last non-null value.
-            for index in indices.iter().flatten() {
-                if !value.is_null(index as usize) {
-                    return Ok(Some(index as usize));
-                }
+        // todo: i think we do store values per row. can do better! also. it SORTS items, while we need just top one!
+
+        let comparator = LexicographicalComparator::try_new(&sort_columns)?;
+        let mut found_value: Option<usize> = None;
+
+        for index in 0..value.len() {
+            // todo - rewrite to (0..n).max_by_key()!
+            if self.ignore_nulls && value.is_null(index) {
+                continue;
             }
-            Ok(None)
-        } else {
-            let indices = lexsort_to_indices(&sort_columns, Some(1))?;
-            Ok((!indices.is_empty()).then_some(indices.value(0) as _))
+
+            if let Some(current_found_value) = found_value {
+                if comparator.compare(current_found_value, index) == self.target {
+                    found_value = Some(index);
+                }
+            } else {
+                found_value = Some(index);
+            }
         }
+
+        Ok(found_value)
     }
 
-    fn with_requirement_satisfied(mut self, requirement_satisfied: bool) -> Self {
-        self.requirement_satisfied = requirement_satisfied;
-        self
+    fn get_first_idx_converter(&self, values: &[ArrayRef]) -> Result<Option<usize>> {
+        let [value, ordering_values @ ..] = values else {
+            return internal_err!("Empty row in FIRST_VALUE");
+        };
+
+        if self.requirement_satisfied {
+            // Get first entry according to the pre-existing ordering (0th index):
+            if self.ignore_nulls {
+                // If ignoring nulls, find the first non-null value.
+                for i in 0..value.len() {
+                    if !value.is_null(i) {
+                        return Ok(Some(i));
+                    }
+                }
+                return Ok(None);
+            } else {
+                // If not ignoring nulls, return the first value if it exists.
+                return Ok((!value.is_empty()).then_some(0));
+            }
+        }
+
+        let converter = RowConverter::new(self.potentially_sortfields.clone())?;
+        let rows = converter.convert_columns(ordering_values)?;
+
+        debug_assert_eq!(value.len(), rows.num_rows());
+
+        Ok((0..value.len()).min_by_key(|i| rows.row(*i)))
     }
 }
 
-impl Accumulator for LastValueAccumulator {
+impl Accumulator for FirstLastAccumulator {
     fn state(&mut self) -> Result<Vec<ScalarValue>> {
-        let mut result = vec![self.last.clone()];
-        result.extend(self.orderings.clone());
+        let mut result = vec![self.value.clone()];
+        result.extend(self.orderings.iter().cloned());
         result.push(ScalarValue::Boolean(Some(self.is_set)));
         Ok(result)
     }
 
     fn update_batch(&mut self, values: &[ArrayRef]) -> Result<()> {
-        if !self.is_set || self.requirement_satisfied {
-            if let Some(last_idx) = self.get_last_idx(values)? {
-                let row = get_row_at_idx(values, last_idx)?;
+        if !self.is_set {
+            if let Some(first_idx) = self.get_first_idx_converter(values)? {
+                let row = get_row_at_idx(values, first_idx)?;
                 self.update_with_new_row(&row);
             }
-        } else if let Some(last_idx) = self.get_last_idx(values)? {
-            let row = get_row_at_idx(values, last_idx)?;
-            let orderings = &row[1..];
-            // Update when there is a more recent entry
-            if compare_rows(
-                &self.orderings,
-                orderings,
-                &get_sort_options(self.ordering_req.as_ref()),
-            )?
-            .is_lt()
-            {
-                self.update_with_new_row(&row);
+        } else if !self.requirement_satisfied {
+            if let Some(first_idx) = self.get_first_idx_converter(values)? {
+                let row = get_row_at_idx(values, first_idx)?;
+                let orderings = &row[1..];
+                if compare_rows(
+                    &self.orderings,
+                    orderings,
+                    &get_sort_options(self.ordering_req.as_ref()),
+                )?
+                .is_gt()
+                {
+                    self.update_with_new_row(&row);
+                }
             }
         }
-
         Ok(())
     }
 
     fn merge_batch(&mut self, states: &[ArrayRef]) -> Result<()> {
-        // LAST_VALUE(last1, last2, last3, ...)
+        // FIRST_VALUE(first1, first2, first3, ...)
         // last index contains is_set flag.
         let is_set_idx = states.len() - 1;
         let flags = states[is_set_idx].as_boolean();
-        let filtered_states = filter_states_according_to_is_set(states, flags)?;
+        let filtered_states =
+            filter_states_according_to_is_set(&states[0..is_set_idx], flags)?;
         // 1..is_set_idx range corresponds to ordering section
-        let sort_cols = convert_to_sort_cols(
+        let sort_columns = convert_to_sort_cols(
             &filtered_states[1..is_set_idx],
             self.ordering_req.as_ref(),
         );
 
-        let ordered_states = if sort_cols.is_empty() {
-            // When no ordering is given, use existing state as is:
-            filtered_states
-        } else {
-            let indices = lexsort_to_indices(&sort_cols, None)?;
-            take_arrays(&filtered_states, &indices, None)?
-        };
+        let comparator = LexicographicalComparator::try_new(&sort_columns)?;
+        let mut min: Option<usize> = None;
 
-        if !ordered_states[0].is_empty() {
-            let last_idx = ordered_states[0].len() - 1;
-            let last_row = get_row_at_idx(&ordered_states, last_idx)?;
-            // When collecting orderings, we exclude the is_set flag from the state.
-            let last_ordering = &last_row[1..is_set_idx];
-            let sort_options = get_sort_options(self.ordering_req.as_ref());
-            // Either there is no existing value, or there is a newer (latest)
-            // version in the new data:
-            if !self.is_set
-                || self.requirement_satisfied
-                || compare_rows(&self.orderings, last_ordering, &sort_options)?.is_lt()
-            {
-                // Update with last value in the state. Note that we should exclude the
-                // is_set flag from the state. Otherwise, we will end up with a state
-                // containing two is_set flags.
-                self.update_with_new_row(&last_row[0..is_set_idx]);
+        for n in 0..filtered_states[0].len() {
+            if let Some(current_min) = min {
+                if comparator.compare(current_min, n) == self.target {
+                    min = Some(n);
+                }
+            } else {
+                min = Some(n);
             }
         }
+
+        if let Some(min) = min {
+            let best_row = get_row_at_idx(&filtered_states, min)?;
+
+            let best_ordering = &best_row[1..is_set_idx];
+            let sort_options = get_sort_options(self.ordering_req.as_ref());
+
+            if !self.is_set
+                || compare_rows(&self.orderings, best_ordering, &sort_options)?
+                    == self.target
+            {
+                self.update_with_new_row(&best_row[0..is_set_idx]);
+            }
+        }
+
         Ok(())
     }
 
     fn evaluate(&mut self) -> Result<ScalarValue> {
-        Ok(self.last.clone())
+        Ok(self.value.clone())
     }
 
     fn size(&self) -> usize {
-        size_of_val(self) - size_of_val(&self.last)
-            + self.last.size()
+        size_of_val(self) - size_of_val(&self.value)
+            + self.value.size()
             + ScalarValue::size_of_vec(&self.orderings)
             - size_of_val(&self.orderings)
     }
@@ -706,17 +588,19 @@ mod tests {
 
     #[test]
     fn test_first_last_value_value() -> Result<()> {
-        let mut first_accumulator = FirstValueAccumulator::try_new(
+        let mut first_accumulator = FirstLastAccumulator::try_new(
             &DataType::Int64,
             &[],
             LexOrdering::default(),
             false,
+            Ordering::Greater,
         )?;
-        let mut last_accumulator = LastValueAccumulator::try_new(
+        let mut last_accumulator = FirstLastAccumulator::try_new(
             &DataType::Int64,
             &[],
             LexOrdering::default(),
             false,
+            Ordering::Less,
         )?;
         // first value in the tuple is start of the range (inclusive),
         // second value in the tuple is end of the range (exclusive)
