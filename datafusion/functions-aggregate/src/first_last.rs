@@ -231,24 +231,32 @@ impl FirstValueAccumulator {
         self.is_set = true;
     }
 
-    fn get_first_idx(&self, values: &[ArrayRef]) -> Result<Option<usize>> {
-        let [value, ordering_values @ ..] = values else {
+    fn get_first_row(&self, values: &[ArrayRef]) -> Result<Option<Vec<ScalarValue>>> {
+        let values: Vec<ArrayRef> = if self.ignore_nulls {
+            match values[0].logical_nulls() {
+                Some(nulls) => {
+                    let nulls = BooleanArray::new(nulls.into_inner(), None);
+
+                    values
+                        .iter()
+                        .map(|t| compute::filter(t, &nulls).unwrap())
+                        .collect()
+                }
+                None => values.to_vec(),
+            }
+        } else {
+            values.to_vec()
+        };
+
+        let [value, ordering_values @ ..] = values.as_slice() else {
             return internal_err!("Empty row in FIRST_VALUE");
         };
         if self.requirement_satisfied {
-            // Get first entry according to the pre-existing ordering (0th index):
-            if self.ignore_nulls {
-                // If ignoring nulls, find the first non-null value.
-                for i in 0..value.len() {
-                    if !value.is_null(i) {
-                        return Ok(Some(i));
-                    }
-                }
-                return Ok(None);
-            } else {
-                // If not ignoring nulls, return the first value if it exists.
-                return Ok((!value.is_empty()).then_some(0));
-            }
+            // get row here
+            // If not ignoring nulls, return the first value if it exists.
+            return Option::transpose(
+                (!value.is_empty()).then_some(get_row_at_idx(&values, 0)),
+            );
         }
         let sort_columns = ordering_values
             .iter()
@@ -259,19 +267,12 @@ impl FirstValueAccumulator {
             })
             .collect::<Vec<_>>();
 
-        if self.ignore_nulls {
-            let indices = lexsort_to_indices(&sort_columns, None)?;
-            // If ignoring nulls, find the first non-null value.
-            for index in indices.iter().flatten() {
-                if !value.is_null(index as usize) {
-                    return Ok(Some(index as usize));
-                }
-            }
-            Ok(None)
-        } else {
-            let indices = lexsort_to_indices(&sort_columns, Some(1))?;
-            Ok((!indices.is_empty()).then_some(indices.value(0) as _))
-        }
+        let indices = lexsort_to_indices(&sort_columns, Some(1))?;
+        let best_index = indices.value(0);
+
+        Option::transpose(
+            (!indices.is_empty()).then_some(get_row_at_idx(&values, best_index as _)),
+        )
     }
 }
 
@@ -285,13 +286,11 @@ impl Accumulator for FirstValueAccumulator {
 
     fn update_batch(&mut self, values: &[ArrayRef]) -> Result<()> {
         if !self.is_set {
-            if let Some(first_idx) = self.get_first_idx(values)? {
-                let row = get_row_at_idx(values, first_idx)?;
+            if let Some(row) = self.get_first_row(values)? {
                 self.update_with_new_row(&row);
             }
         } else if !self.requirement_satisfied {
-            if let Some(first_idx) = self.get_first_idx(values)? {
-                let row = get_row_at_idx(values, first_idx)?;
+            if let Some(row) = self.get_first_row(values)? {
                 let orderings = &row[1..];
                 if compare_rows(
                     &self.orderings,
@@ -323,7 +322,7 @@ impl Accumulator for FirstValueAccumulator {
             // When no ordering is given, use the existing state as is:
             filtered_states
         } else {
-            let indices = lexsort_to_indices(&sort_cols, None)?;
+            let indices = lexsort_to_indices(&sort_cols, Some(1))?;
             take_arrays(&filtered_states, &indices, None)?
         };
         if !ordered_states[0].is_empty() {
