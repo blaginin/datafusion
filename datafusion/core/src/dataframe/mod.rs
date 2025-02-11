@@ -1795,21 +1795,44 @@ impl DataFrame {
                 )) => return Ok(self),
                 Err(err) => return Err(err),
             };
-        let projection = self
-            .plan
-            .schema()
-            .iter()
-            .map(|(qualifier, field)| {
+
+
+        let project_plan = if let LogicalPlan::Projection(p) = &self.plan {
+
+            let mut exprs = p.expr.clone();
+
+            for (qualifier, field) in p.schema.iter() {
                 if qualifier.eq(&qualifier_rename) && field.as_ref() == field_rename {
-                    col(Column::from((qualifier, field))).alias(new_name)
-                } else {
-                    col(Column::from((qualifier, field)))
+                    let e = col(Column::from((qualifier, field))).alias(new_name);
+                    exprs.push(e);
                 }
-            })
-            .collect::<Vec<_>>();
-        let project_plan = LogicalPlanBuilder::from(self.plan)
-            .project(projection)?
-            .build()?;
+            }
+
+            let p = datafusion_expr::Projection::try_new(exprs, Arc::clone(&p.input))?;
+            // todo: datafusion_expr::Projection::try_new_with_schema(exprs, Arc::clone(&p.input), Arc::clone(&p.schema))?;
+            LogicalPlan::Projection(p)
+
+        } else {
+
+            let projection = self
+                .plan
+                .schema()
+                .iter()
+                .map(|(qualifier, field)| {
+                    if qualifier.eq(&qualifier_rename) && field.as_ref() == field_rename {
+                        col(Column::from((qualifier, field))).alias(new_name)
+                    } else {
+                        col(Column::from((qualifier, field)))
+                    }
+                })
+                .collect::<Vec<_>>();
+
+            LogicalPlanBuilder::from(self.plan)
+                .project(projection)?
+                .build()?
+        };
+
+
         Ok(DataFrame {
             session_state: self.session_state,
             plan: project_plan,
