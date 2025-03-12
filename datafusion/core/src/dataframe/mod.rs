@@ -1033,6 +1033,42 @@ impl DataFrame {
         })
     }
 
+    /// Sort the DataFrame by all columns in the schema.
+    ///
+    /// # Example
+    /// ```
+    /// # use datafusion::prelude::*;
+    /// # use datafusion::error::Result;
+    /// # use datafusion_common::assert_batches_eq;
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<()> {
+    /// let ctx = SessionContext::new();
+    /// let df = ctx.read_csv("tests/data/example_long.csv", CsvReadOptions::new()).await?;
+    /// let df = df.select(vec![(-col("a")).alias("-a"), col("b"), col("c")])?.sort_by_all()?;
+    /// let expected = vec![
+    ///    "+----+---+---+",
+    ///    "| -a | b | c |",
+    ///    "+----+---+---+",
+    ///    "| -7 | 8 | 9 |",
+    ///    "| -4 | 5 | 6 |",
+    ///    "| -1 | 2 | 3 |",
+    ///    "+----+---+---+",
+    /// ];
+    /// # assert_batches_eq!(expected, &df.collect().await?);
+    /// # Ok(())
+    /// # }
+    ///
+    ///
+    pub fn sort_by_all(self) -> Result<DataFrame> {
+        let cols = self
+            .schema()
+            .fields()
+            .iter()
+            .map(|f| col(f.name()))
+            .collect();
+        self.sort_by(cols)
+    }
+
     /// Join this `DataFrame` with another `DataFrame` using explicitly specified
     /// columns and an optional filter expression.
     ///

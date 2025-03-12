@@ -61,7 +61,7 @@ use datafusion::test_util::{
     test_table_with_name,
 };
 use datafusion_catalog::TableProvider;
-use datafusion_common::test_util::{batches_to_sort_string, batches_to_string};
+use datafusion_common::test_util::batches_to_string;
 use datafusion_common::{
     assert_contains, Constraint, Constraints, DataFusionError, ParamValues, ScalarValue,
     TableReference, UnnestOptions,
@@ -326,10 +326,10 @@ async fn select_with_periods() -> Result<()> {
 
     let df = ctx.table("t").await?.select_columns(&["f.c1"])?;
 
-    let df_results = df.collect().await?;
+    let df_results = df.sort_by_all()?.collect().await?;
 
     assert_snapshot!(
-        batches_to_sort_string(&df_results),
+        batches_to_string(&df_results),
         @r###"
     +------+
     | f.c1 |
@@ -432,16 +432,16 @@ async fn drop_with_quotes() -> Result<()> {
 
     let df = ctx.table("t").await?.drop_columns(&["f\"c1"])?;
 
-    let df_results = df.collect().await?;
+    let df_results = df.sort_by_all().unwrap().collect().await?;
 
     assert_snapshot!(
-        batches_to_sort_string(&df_results),
+        batches_to_string(&df_results),
         @r###"
     +------+
     | f"c2 |
     +------+
-    | 11   |
     | 2    |
+    | 11   |
     +------+
     "###
     );
@@ -464,10 +464,10 @@ async fn drop_with_periods() -> Result<()> {
 
     let df = ctx.table("t").await?.drop_columns(&["f.c1"])?;
 
-    let df_results = df.collect().await?;
+    let df_results = df.sort_by_all().unwrap().collect().await?;
 
     assert_snapshot!(
-        batches_to_sort_string(&df_results),
+        batches_to_string(&df_results),
         @r###"
     +------+
     | f.c2 |
@@ -495,10 +495,15 @@ async fn aggregate() -> Result<()> {
         count_distinct(col("c12")),
     ];
 
-    let df: Vec<RecordBatch> = df.aggregate(group_expr, aggr_expr)?.collect().await?;
+    let df: Vec<RecordBatch> = df
+        .aggregate(group_expr, aggr_expr)?
+        .sort_by_all()
+        .unwrap()
+        .collect()
+        .await?;
 
     assert_snapshot!(
-        batches_to_sort_string(&df),
+        batches_to_string(&df),
         @r###"
     +----+-----------------------------+-----------------------------+-----------------------------+-----------------------------+-------------------------------+----------------------------------------+
     | c1 | min(aggregate_test_100.c12) | max(aggregate_test_100.c12) | avg(aggregate_test_100.c12) | sum(aggregate_test_100.c12) | count(aggregate_test_100.c12) | count(DISTINCT aggregate_test_100.c12) |
@@ -565,10 +570,10 @@ async fn test_aggregate_with_pk() -> Result<()> {
     "###
     );
 
-    let df_results = df.collect().await?;
+    let df_results = df.sort_by_all().unwrap().collect().await?;
 
     assert_snapshot!(
-        batches_to_sort_string(&df_results),
+        batches_to_string(&df_results),
         @r###"
     +----+------+
     | id | name |
@@ -610,10 +615,10 @@ async fn test_aggregate_with_pk2() -> Result<()> {
 
     // Since id and name are functionally dependant, we can use name among expression
     // even if it is not part of the group by expression.
-    let df_results = df.collect().await?;
+    let df_results = df.sort_by_all().unwrap().collect().await?;
 
     assert_snapshot!(
-        batches_to_sort_string(&df_results),
+        batches_to_string(&df_results),
         @r###"
     +----+------+
     | id | name |
@@ -659,10 +664,10 @@ async fn test_aggregate_with_pk3() -> Result<()> {
 
     // Since id and name are functionally dependant, we can use name among expression
     // even if it is not part of the group by expression.
-    let df_results = df.collect().await?;
+    let df_results = df.sort_by_all().unwrap().collect().await?;
 
     assert_snapshot!(
-        batches_to_sort_string(&df_results),
+        batches_to_string(&df_results),
         @r###"
     +----+------+
     | id | name |
@@ -711,7 +716,7 @@ async fn test_aggregate_with_pk4() -> Result<()> {
     let df_results = df.collect().await?;
 
     assert_snapshot!(
-        batches_to_sort_string(&df_results),
+        batches_to_string(&df_results),
         @r###"
     +----+
     | id |
@@ -736,10 +741,10 @@ async fn test_aggregate_alias() -> Result<()> {
         // GROUP BY c2 as "c2" (alias in expr is not supported by SQL)
         .aggregate(vec![col("c2").alias("c2")], vec![])?;
 
-    let df_results = df.collect().await?;
+    let df_results = df.sort_by_all()?.collect().await?;
 
     assert_snapshot!(
-        batches_to_sort_string(&df_results),
+        batches_to_string(&df_results),
         @r###"
     +----+
     | c2 |
@@ -783,10 +788,10 @@ async fn test_aggregate_with_union() -> Result<()> {
         // SELECT `c1`, sum(result) as `sum_result`
         .select(vec![(col("c1")), col("sum_result")])?;
 
-    let df_results = df.collect().await?;
+    let df_results = df.sort_by_all()?.collect().await?;
 
     assert_snapshot!(
-        batches_to_sort_string(&df_results),
+        batches_to_string(&df_results),
         @r###"
     +----+------------+
     | c1 | sum_result |
@@ -819,10 +824,10 @@ async fn test_aggregate_subexpr() -> Result<()> {
             (aggr_expr + lit(20)).alias("sum"),
         ])?;
 
-    let df_results = df.collect().await?;
+    let df_results = df.sort_by_all()?.collect().await?;
 
     assert_snapshot!(
-        batches_to_sort_string(&df_results),
+        batches_to_string(&df_results),
         @r###"
     +----------------+------+
     | c2 + Int32(10) | sum  |
@@ -911,35 +916,40 @@ async fn window_using_aggregates() -> Result<()> {
     .collect::<Vec<_>>();
     aggr_expr.extend_from_slice(&[col("c2"), col("c3")]);
 
-    let df: Vec<RecordBatch> = df.select(aggr_expr)?.collect().await?;
+    let df: Vec<RecordBatch> = df
+        .select(aggr_expr)?
+        .sort_by_all()
+        .unwrap()
+        .collect()
+        .await?;
 
     assert_snapshot!(
-        batches_to_sort_string(&df),
+        batches_to_string(&df),
         @r###"
     +-------------+----------+-----------------+---------------+--------+-----+------+----+------+
     | first_value | last_val | approx_distinct | approx_median | median | max | min  | c2 | c3   |
     +-------------+----------+-----------------+---------------+--------+-----+------+----+------+
-    |             |          |                 |               |        |     |      | 1  | -85  |
     | -85         | -101     | 14              | -12           | -101   | 83  | -101 | 4  | -54  |
     | -85         | -101     | 17              | -25           | -101   | 83  | -101 | 5  | -31  |
-    | -85         | -12      | 10              | -32           | -12    | 83  | -85  | 3  | 13   |
-    | -85         | -25      | 3               | -56           | -25    | -25 | -85  | 1  | -5   |
-    | -85         | -31      | 18              | -29           | -31    | 83  | -101 | 5  | 36   |
-    | -85         | -38      | 16              | -25           | -38    | 83  | -101 | 4  | 65   |
-    | -85         | -43      | 7               | -43           | -43    | 83  | -85  | 2  | 45   |
-    | -85         | -48      | 6               | -35           | -48    | 83  | -85  | 2  | -43  |
-    | -85         | -5       | 4               | -37           | -5     | -5  | -85  | 1  | 83   |
-    | -85         | -54      | 15              | -17           | -54    | 83  | -101 | 4  | -38  |
-    | -85         | -56      | 2               | -70           | -56    | -56 | -85  | 1  | -25  |
-    | -85         | -72      | 9               | -43           | -72    | 83  | -85  | 3  | -12  |
     | -85         | -85      | 1               | -85           | -85    | -85 | -85  | 1  | -56  |
-    | -85         | 13       | 11              | -17           | 13     | 83  | -85  | 3  | 14   |
+    | -85         | -72      | 9               | -43           | -72    | 83  | -85  | 3  | -12  |
+    | -85         | -56      | 2               | -70           | -56    | -56 | -85  | 1  | -25  |
+    | -85         | -54      | 15              | -17           | -54    | 83  | -101 | 4  | -38  |
+    | -85         | -48      | 6               | -35           | -48    | 83  | -85  | 2  | -43  |
+    | -85         | -43      | 7               | -43           | -43    | 83  | -85  | 2  | 45   |
+    | -85         | -38      | 16              | -25           | -38    | 83  | -101 | 4  | 65   |
+    | -85         | -31      | 18              | -29           | -31    | 83  | -101 | 5  | 36   |
+    | -85         | -25      | 3               | -56           | -25    | -25 | -85  | 1  | -5   |
+    | -85         | -12      | 10              | -32           | -12    | 83  | -85  | 3  | 13   |
+    | -85         | -5       | 4               | -37           | -5     | -5  | -85  | 1  | 83   |
     | -85         | 13       | 11              | -25           | 13     | 83  | -85  | 3  | 13   |
+    | -85         | 13       | 11              | -17           | 13     | 83  | -85  | 3  | 14   |
     | -85         | 14       | 12              | -12           | 14     | 83  | -85  | 3  | 17   |
     | -85         | 17       | 13              | -11           | 17     | 83  | -85  | 4  | -101 |
     | -85         | 45       | 8               | -34           | 45     | 83  | -85  | 3  | -72  |
     | -85         | 65       | 17              | -17           | 65     | 83  | -101 | 5  | -101 |
     | -85         | 83       | 5               | -25           | 83     | 83  | -85  | 2  | -48  |
+    |             |          |                 |               |        |     |      | 1  | -85  |
     +-------------+----------+-----------------+---------------+--------+-----+------+----+------+
     "###
     );
@@ -993,10 +1003,10 @@ async fn test_distinct_sort_by() -> Result<()> {
         .sort(vec![col("c1").sort(true, true)])
         .unwrap();
 
-    let df_results = plan.clone().collect().await?;
+    let df_results = plan.clone().sort_by_all().unwrap().collect().await?;
 
     assert_snapshot!(
-        batches_to_sort_string(&df_results),
+        batches_to_string(&df_results),
         @r###"
     +----+
     | c1 |
@@ -1041,10 +1051,10 @@ async fn test_distinct_on() -> Result<()> {
 
     assert_same_plan(&plan.logical_plan().clone(), &sql_plan);
 
-    let df_results = plan.clone().collect().await?;
+    let df_results = plan.clone().sort_by_all().unwrap().collect().await?;
 
     assert_snapshot!(
-        batches_to_sort_string(&df_results),
+        batches_to_string(&df_results),
         @r###"
     +----+
     | c1 |
@@ -1076,10 +1086,10 @@ async fn test_distinct_on_sort_by() -> Result<()> {
         .sort(vec![col("c1").sort(true, true)])
         .unwrap();
 
-    let df_results = plan.clone().collect().await?;
+    let df_results = plan.clone().sort_by_all().unwrap().collect().await?;
 
     assert_snapshot!(
-        batches_to_sort_string(&df_results),
+        batches_to_string(&df_results),
         @r###"
     +----+
     | c1 |
@@ -1150,10 +1160,11 @@ async fn join_coercion_unnamed() -> Result<()> {
 
     let filter = None;
     let join = right.join(left, JoinType::LeftAnti, &cols, &cols, filter)?;
-    let results = join.collect().await?;
+
+    let results = join.sort_by_all().unwrap().collect().await?;
 
     assert_snapshot!(
-        batches_to_sort_string(&results),
+        batches_to_string(&results),
         @r###"
     +----+------+
     | id | name |
@@ -1369,26 +1380,31 @@ async fn register_table() -> Result<()> {
         .aggregate(group_expr.clone(), aggr_expr.clone())?
         .collect()
         .await?;
-    let table_results = &table.aggregate(group_expr, aggr_expr)?.collect().await?;
+    let table_results = &table
+        .aggregate(group_expr, aggr_expr)?
+        .sort_by_all()
+        .unwrap()
+        .collect()
+        .await?;
 
     assert_snapshot!(
-        batches_to_sort_string(&df_results),
+        batches_to_string(&df_results),
         @r###"
     +----+-----------------------------+
     | c1 | sum(aggregate_test_100.c12) |
     +----+-----------------------------+
-    | a  | 10.238448667882977          |
-    | b  | 7.797734760124923           |
     | c  | 13.860958726523545          |
+    | a  | 10.238448667882977          |
     | d  | 8.793968289758968           |
     | e  | 10.206140546981722          |
+    | b  | 7.797734760124923           |
     +----+-----------------------------+
     "###
     );
 
     // the results are the same as the results from the view, modulo the leaf table name
     assert_snapshot!(
-        batches_to_sort_string(table_results),
+        batches_to_string(table_results),
         @r###"
     +----+---------------------+
     | c1 | sum(test_table.c12) |
@@ -1427,16 +1443,16 @@ async fn with_column() -> Result<()> {
         .with_column("sum", col("c2") + col("c3"))?;
 
     // check that new column added
-    let df_results = df.clone().collect().await?;
+    let df_results = df.clone().sort_by_all().unwrap().collect().await?;
 
     assert_snapshot!(
-        batches_to_sort_string(&df_results),
+        batches_to_string(&df_results),
         @r###"
     +----+----+-----+-----+
     | c1 | c2 | c3  | sum |
     +----+----+-----+-----+
-    | a  | 3  | -12 | -9  |
     | a  | 3  | -72 | -69 |
+    | a  | 3  | -12 | -9  |
     | a  | 3  | 13  | 16  |
     | a  | 3  | 13  | 16  |
     | a  | 3  | 14  | 17  |
@@ -1449,11 +1465,12 @@ async fn with_column() -> Result<()> {
     let df_results_overwrite = df
         .clone()
         .with_column("c1", col("c2") + col("c3"))?
+        .sort_by_all()?
         .collect()
         .await?;
 
     assert_snapshot!(
-        batches_to_sort_string(&df_results_overwrite),
+        batches_to_string(&df_results_overwrite),
         @r###"
     +-----+----+-----+-----+
     | c1  | c2 | c3  | sum |
@@ -1472,17 +1489,18 @@ async fn with_column() -> Result<()> {
     let df_results_overwrite_self = df
         .clone()
         .with_column("c2", col("c2") + lit(1))?
+        .sort_by_all()?
         .collect()
         .await?;
 
     assert_snapshot!(
-        batches_to_sort_string(&df_results_overwrite_self),
+        batches_to_string(&df_results_overwrite_self),
         @r###"
     +----+----+-----+-----+
     | c1 | c2 | c3  | sum |
     +----+----+-----+-----+
-    | a  | 4  | -12 | -9  |
     | a  | 4  | -72 | -69 |
+    | a  | 4  | -12 | -9  |
     | a  | 4  | 13  | 16  |
     | a  | 4  | 13  | 16  |
     | a  | 4  | 14  | 17  |
@@ -1513,9 +1531,9 @@ async fn test_window_function_with_column() -> Result<()> {
     df.clone().show().await?;
     assert_eq!(5, df.schema().fields().len());
 
-    let df_results = df.clone().collect().await?;
+    let df_results = df.clone().sort_by_all()?.collect().await?;
     assert_snapshot!(
-        batches_to_sort_string(&df_results),
+        batches_to_string(&df_results),
         @r###"
     +----+----+-----+-----+---+
     | c1 | c2 | c3  | s   | r |
@@ -1555,9 +1573,9 @@ async fn with_column_join_same_columns() -> Result<()> {
         ])?
         .limit(0, Some(1))?;
 
-    let df_results = df.clone().collect().await?;
+    let df_results = df.clone().sort_by_all().unwrap().collect().await?;
     assert_snapshot!(
-        batches_to_sort_string(&df_results),
+        batches_to_string(&df_results),
         @r###"
     +----+----+
     | c1 | c1 |
@@ -1594,10 +1612,10 @@ async fn with_column_join_same_columns() -> Result<()> {
     "###
     );
 
-    let df_results = df_with_column.collect().await?;
+    let df_results = df_with_column.sort_by_all().unwrap().collect().await?;
 
     assert_snapshot!(
-        batches_to_sort_string(&df_results),
+        batches_to_string(&df_results),
         @r###"
     +----+----+------------+
     | c1 | c1 | new_column |
@@ -1653,7 +1671,7 @@ async fn with_column_renamed() -> Result<()> {
     let batches = &df_sum_renamed.collect().await?;
 
     assert_snapshot!(
-        batches_to_sort_string(batches),
+        batches_to_string(batches),
         @r###"
     +-----+-----+-----+-------+
     | one | two | c3  | total |
@@ -1724,7 +1742,7 @@ async fn with_column_renamed_join() -> Result<()> {
 
     let df_results = df.clone().collect().await?;
     assert_snapshot!(
-        batches_to_sort_string(&df_results),
+        batches_to_string(&df_results),
         @r###"
     +----+----+-----+----+----+-----+
     | c1 | c2 | c3  | c1 | c2 | c3  |
@@ -1764,7 +1782,7 @@ async fn with_column_renamed_join() -> Result<()> {
     let df_results = df_renamed.collect().await?;
 
     assert_snapshot!(
-        batches_to_sort_string(&df_results),
+        batches_to_string(&df_results),
         @r###"
     +-----+----+-----+----+----+-----+
     | AAA | c2 | c3  | c1 | c2 | c3  |
@@ -1805,7 +1823,7 @@ async fn with_column_renamed_case_sensitive() -> Result<()> {
     let res = &df_renamed.clone().collect().await?;
 
     assert_snapshot!(
-        batches_to_sort_string(res),
+        batches_to_string(res),
         @r###"
     +---------+
     | CoLuMn1 |
@@ -1821,7 +1839,7 @@ async fn with_column_renamed_case_sensitive() -> Result<()> {
         .await?;
 
     assert_snapshot!(
-        batches_to_sort_string(&df_renamed),
+        batches_to_string(&df_renamed),
         @r###"
     +----+
     | c1 |
@@ -1845,7 +1863,7 @@ async fn cast_expr_test() -> Result<()> {
     let df_results = df.clone().collect().await?;
     df.clone().show().await?;
     assert_snapshot!(
-        batches_to_sort_string(&df_results),
+        batches_to_string(&df_results),
         @r###"
     +----+----+-----+
     | c2 | c3 | sum |
@@ -1908,10 +1926,10 @@ async fn with_column_name() -> Result<()> {
         // try and create a column with a '.' in it
         .with_column("f.c2", lit("hello"))?;
 
-    let df_results = df.collect().await?;
+    let df_results = df.sort_by_all().unwrap().collect().await?;
 
     assert_snapshot!(
-        batches_to_sort_string(&df_results),
+        batches_to_string(&df_results),
         @r###"
     +------+-------+
     | f.c1 | f.c2  |
@@ -1954,7 +1972,7 @@ async fn cache_test() -> Result<()> {
     let df_results = df.collect().await?;
     let cached_df_results = cached_df.collect().await?;
     assert_snapshot!(
-        batches_to_sort_string(&cached_df_results),
+        batches_to_string(&cached_df_results),
         @r###"
     +----+----+-----+
     | c2 | c3 | sum |
@@ -3439,9 +3457,9 @@ async fn join_with_alias_filter() -> Result<()> {
     "###
     );
 
-    let results = df.collect().await?;
+    let results = df.sort_by_all()?.collect().await?;
     assert_snapshot!(
-        batches_to_sort_string(&results),
+        batches_to_string(&results),
         @r###"
     +----+----+---+----+---+---+
     | a  | a  | b | c  | b | c |
@@ -3486,9 +3504,9 @@ async fn right_semi_with_alias_filter() -> Result<()> {
     "###
     );
 
-    let results = df.collect().await?;
+    let results = df.sort_by_all()?.collect().await?;
     assert_snapshot!(
-        batches_to_sort_string(&results),
+        batches_to_string(&results),
         @r###"
     +-----+---+---+
     | a   | b | c |
@@ -3532,15 +3550,15 @@ async fn right_anti_filter_push_down() -> Result<()> {
     "###
     );
 
-    let results = df.collect().await?;
+    let results = df.sort_by_all().unwrap().collect().await?;
     assert_snapshot!(
-        batches_to_sort_string(&results),
+        batches_to_string(&results),
         @r###"
     +----+---+---+
     | a  | b | c |
     +----+---+---+
-    | 13 | c | 3 |
     | 3  | a | 1 |
+    | 13 | c | 3 |
     +----+---+---+
     "###
     );
@@ -3552,9 +3570,9 @@ async fn right_anti_filter_push_down() -> Result<()> {
 async fn unnest_columns() -> Result<()> {
     const NUM_ROWS: usize = 4;
     let df = table_with_nested_types(NUM_ROWS).await?;
-    let results = df.collect().await?;
+    let results = df.sort_by_all().unwrap().collect().await?;
     assert_snapshot!(
-        batches_to_sort_string(&results),
+        batches_to_string(&results),
         @r###"
     +----------+------------------------------------------------+--------------------+
     | shape_id | points                                         | tags               |
@@ -3569,9 +3587,13 @@ async fn unnest_columns() -> Result<()> {
 
     // Unnest tags
     let df = table_with_nested_types(NUM_ROWS).await?;
-    let results = df.unnest_columns(&["tags"])?.collect().await?;
+    let results = df
+        .unnest_columns(&["tags"])?
+        .sort_by_all()?
+        .collect()
+        .await?;
     assert_snapshot!(
-        batches_to_sort_string(&results),
+        batches_to_string(&results),
         @r###"
     +----------+------------------------------------------------+------+
     | shape_id | points                                         | tags |
@@ -3594,9 +3616,14 @@ async fn unnest_columns() -> Result<()> {
 
     // Unnest points
     let df = table_with_nested_types(NUM_ROWS).await?;
-    let results = df.unnest_columns(&["points"])?.collect().await?;
+    let results = df
+        .unnest_columns(&["points"])?
+        .sort_by_all()
+        .unwrap()
+        .collect()
+        .await?;
     assert_snapshot!(
-        batches_to_sort_string(&results),
+        batches_to_string(&results),
         @r###"
     +----------+-----------------+--------------------+
     | shape_id | points          | tags               |
@@ -3623,10 +3650,11 @@ async fn unnest_columns() -> Result<()> {
     let results = df
         .unnest_columns(&["points"])?
         .unnest_columns(&["tags"])?
+        .sort_by_all()?
         .collect()
         .await?;
     assert_snapshot!(
-        batches_to_sort_string(&results),
+        batches_to_string(&results),
         @r###"
     +----------+-----------------+------+
     | shape_id | points          | tags |
@@ -3799,9 +3827,9 @@ async fn unnest_fixed_list() -> Result<()> {
     ctx.register_batch("shapes", batch)?;
     let df = ctx.table("shapes").await?;
 
-    let results = df.clone().collect().await?;
+    let results = df.clone().sort_by_all().unwrap().collect().await?;
     assert_snapshot!(
-        batches_to_sort_string(&results),
+        batches_to_string(&results),
         @r###"
     +----------+----------------+
     | shape_id | tags           |
@@ -3820,10 +3848,11 @@ async fn unnest_fixed_list() -> Result<()> {
 
     let results = df
         .unnest_columns_with_options(&["tags"], options)?
+        .sort_by_all()?
         .collect()
         .await?;
     assert_snapshot!(
-        batches_to_sort_string(&results),
+        batches_to_string(&results),
         @r###"
     +----------+-------+
     | shape_id | tags  |
@@ -3853,9 +3882,9 @@ async fn unnest_fixed_list_drop_nulls() -> Result<()> {
     ctx.register_batch("shapes", batch)?;
     let df = ctx.table("shapes").await?;
 
-    let results = df.clone().collect().await?;
+    let results = df.clone().sort_by_all().unwrap().collect().await?;
     assert_snapshot!(
-        batches_to_sort_string(&results),
+        batches_to_string(&results),
         @r###"
     +----------+----------------+
     | shape_id | tags           |
@@ -3874,10 +3903,11 @@ async fn unnest_fixed_list_drop_nulls() -> Result<()> {
 
     let results = df
         .unnest_columns_with_options(&["tags"], options)?
+        .sort_by_all()?
         .collect()
         .await?;
     assert_snapshot!(
-        batches_to_sort_string(&results),
+        batches_to_string(&results),
         @r###"
     +----------+-------+
     | shape_id | tags  |
@@ -3924,9 +3954,9 @@ async fn unnest_fixed_list_non_null() -> Result<()> {
     ctx.register_batch("shapes", batch)?;
     let df = ctx.table("shapes").await?;
 
-    let results = df.clone().collect().await?;
+    let results = df.clone().sort_by_all().unwrap().collect().await?;
     assert_snapshot!(
-        batches_to_sort_string(&results),
+        batches_to_string(&results),
         @r###"
     +----------+----------------+
     | shape_id | tags           |
@@ -3944,10 +3974,11 @@ async fn unnest_fixed_list_non_null() -> Result<()> {
     let options = UnnestOptions::new().with_preserve_nulls(true);
     let results = df
         .unnest_columns_with_options(&["tags"], options)?
+        .sort_by_all()?
         .collect()
         .await?;
     assert_snapshot!(
-        batches_to_sort_string(&results),
+        batches_to_string(&results),
         @r###"
     +----------+-------+
     | shape_id | tags  |
@@ -3976,18 +4007,22 @@ async fn unnest_aggregate_columns() -> Result<()> {
     const NUM_ROWS: usize = 5;
 
     let df = table_with_nested_types(NUM_ROWS).await?;
-    let results = df.select_columns(&["tags"])?.collect().await?;
+    let results = df
+        .select_columns(&["tags"])?
+        .sort_by_all()?
+        .collect()
+        .await?;
     assert_snapshot!(
-        batches_to_sort_string(&results),
+        batches_to_string(&results),
         @r###"
     +--------------------+
     | tags               |
     +--------------------+
-    |                    |
-    | [tag1, tag2, tag3] |
-    | [tag1, tag2, tag3] |
-    | [tag1, tag2]       |
     | [tag1]             |
+    | [tag1, tag2]       |
+    | [tag1, tag2, tag3] |
+    | [tag1, tag2, tag3] |
+    |                    |
     +--------------------+
     "###
     );
@@ -3999,7 +4034,7 @@ async fn unnest_aggregate_columns() -> Result<()> {
         .collect()
         .await?;
     assert_snapshot!(
-        batches_to_sort_string(&results),
+        batches_to_string(&results),
         @r###"
     +-------------+
     | count(tags) |
@@ -4070,7 +4105,7 @@ async fn unnest_array_agg() -> Result<()> {
     ctx.register_batch("shapes", batch)?;
     let df = ctx.table("shapes").await?;
 
-    let results = df.clone().collect().await?;
+    let results = df.clone().sort_by_all()?.collect().await?;
 
     // Assert that there are no empty batches in result
     for rb in results.clone() {
@@ -4078,7 +4113,7 @@ async fn unnest_array_agg() -> Result<()> {
     }
 
     assert_snapshot!(
-        batches_to_sort_string(&results),
+        batches_to_string(&results),
         @r###"
     +----------+--------+
     | shape_id | tag_id |
@@ -4103,10 +4138,11 @@ async fn unnest_array_agg() -> Result<()> {
             vec![col("shape_id")],
             vec![array_agg(col("tag_id")).alias("tag_id")],
         )?
+        .sort_by_all()?
         .collect()
         .await?;
     assert_snapshot!(
-        batches_to_sort_string(&results),
+        batches_to_string(&results),
         @r###"
     +----------+--------------+
     | shape_id | tag_id       |
@@ -4127,10 +4163,11 @@ async fn unnest_array_agg() -> Result<()> {
             vec![array_agg(col("tag_id")).alias("tag_id")],
         )?
         .unnest_columns(&["tag_id"])?
+        .sort_by_all()?
         .collect()
         .await?;
     assert_snapshot!(
-        batches_to_sort_string(&results),
+        batches_to_string(&results),
         @r###"
     +----------+--------+
     | shape_id | tag_id |
@@ -4172,9 +4209,9 @@ async fn unnest_with_redundant_columns() -> Result<()> {
     ctx.register_batch("shapes", batch)?;
     let df = ctx.table("shapes").await?;
 
-    let results = df.clone().collect().await?;
+    let results = df.clone().sort_by_all()?.collect().await?;
     assert_snapshot!(
-        batches_to_sort_string(&results),
+        batches_to_string(&results),
         @r###"
     +----------+--------+
     | shape_id | tag_id |
@@ -4216,9 +4253,9 @@ async fn unnest_with_redundant_columns() -> Result<()> {
     "###
     );
 
-    let results = df.collect().await?;
+    let results = df.sort_by_all()?.collect().await?;
     assert_snapshot!(
-        batches_to_sort_string(&results),
+        batches_to_string(&results),
         @r###"
     +----------+
     | shape_id |
@@ -4397,9 +4434,9 @@ async fn test_read_batches() -> Result<()> {
     ];
     let df = ctx.read_batches(batches).unwrap();
     df.clone().show().await.unwrap();
-    let results = df.collect().await?;
+    let results = df.sort_by_all()?.collect().await?;
     assert_snapshot!(
-        batches_to_sort_string(&results),
+        batches_to_string(&results),
         @r###"
     +----+--------+
     | id | number |
@@ -4433,7 +4470,7 @@ async fn test_read_batches_empty() -> Result<()> {
     df.clone().show().await.unwrap();
     let results = df.collect().await?;
     assert_snapshot!(
-        batches_to_sort_string(&results),
+        batches_to_string(&results),
         @r###"
     ++
     ++
@@ -4480,9 +4517,9 @@ async fn consecutive_projection_same_schema() -> Result<()> {
         )
         .unwrap();
 
-    let results = df.collect().await?;
+    let results = df.sort_by_all()?.collect().await?;
     assert_snapshot!(
-        batches_to_sort_string(&results),
+        batches_to_string(&results),
         @r###"
     +----+----+----+
     | id | t  | t2 |
@@ -5093,9 +5130,9 @@ async fn write_partitioned_parquet_results() -> Result<()> {
         .await?;
 
     // Check that the df has the entire set of data
-    let results = df.collect().await?;
+    let results = df.sort_by_all()?.collect().await?;
     assert_snapshot!(
-        batches_to_sort_string(&results),
+        batches_to_string(&results),
         @r###"
     +-----+-----+
     | c1  | c2  |
@@ -5225,7 +5262,7 @@ async fn sparse_union_is_null() {
 
     // view_all
     assert_snapshot!(
-        batches_to_sort_string(&df.clone().collect().await.unwrap()),
+        batches_to_string(&df.clone().sort_by_all().unwrap().collect().await.unwrap()),
         @r###"
     +----------+
     | my_union |
@@ -5241,9 +5278,14 @@ async fn sparse_union_is_null() {
     );
 
     // filter where is null
-    let result_df = df.clone().filter(col("my_union").is_null()).unwrap();
+    let result_df = df
+        .clone()
+        .filter(col("my_union").is_null())
+        .unwrap()
+        .sort_by_all()
+        .unwrap();
     assert_snapshot!(
-        batches_to_sort_string(&result_df.collect().await.unwrap()),
+        batches_to_string(&result_df.collect().await.unwrap()),
         @r###"
     +----------+
     | my_union |
@@ -5256,9 +5298,13 @@ async fn sparse_union_is_null() {
     );
 
     // filter where is not null
-    let result_df = df.filter(col("my_union").is_not_null()).unwrap();
+    let result_df = df
+        .filter(col("my_union").is_not_null())
+        .unwrap()
+        .sort_by_all()
+        .unwrap();
     assert_snapshot!(
-        batches_to_sort_string(&result_df.collect().await.unwrap()),
+        batches_to_string(&result_df.collect().await.unwrap()),
         @r###"
     +----------+
     | my_union |
@@ -5304,11 +5350,16 @@ async fn dense_union_is_null() {
 
     ctx.register_batch("union_batch", batch).unwrap();
 
-    let df = ctx.table("union_batch").await.unwrap();
+    let df = ctx
+        .table("union_batch")
+        .await
+        .unwrap()
+        .sort_by_all()
+        .unwrap();
 
     // view_all
     assert_snapshot!(
-        batches_to_sort_string(&df.clone().collect().await.unwrap()),
+        batches_to_string(&df.clone().collect().await.unwrap()),
         @r###"
     +----------+
     | my_union |
@@ -5324,9 +5375,14 @@ async fn dense_union_is_null() {
     );
 
     // filter where is null
-    let result_df = df.clone().filter(col("my_union").is_null()).unwrap();
+    let result_df = df
+        .clone()
+        .filter(col("my_union").is_null())
+        .unwrap()
+        .sort_by_all()
+        .unwrap();
     assert_snapshot!(
-        batches_to_sort_string(&result_df.collect().await.unwrap()),
+        batches_to_string(&result_df.collect().await.unwrap()),
         @r###"
     +----------+
     | my_union |
@@ -5339,9 +5395,13 @@ async fn dense_union_is_null() {
     );
 
     // filter where is not null
-    let result_df = df.filter(col("my_union").is_not_null()).unwrap();
+    let result_df = df
+        .filter(col("my_union").is_not_null())
+        .unwrap()
+        .sort_by_all()
+        .unwrap();
     assert_snapshot!(
-        batches_to_sort_string(&result_df.collect().await.unwrap()),
+        batches_to_string(&result_df.collect().await.unwrap()),
         @r###"
     +----------+
     | my_union |
@@ -5486,12 +5546,14 @@ async fn test_alias() -> Result<()> {
     "###);
 
     // Select over the aliased DataFrame
-    let df = df.select(vec![
-        col("table_alias.a"),
-        col("b") + col("table_alias.one"),
-    ])?;
+    let df = df
+        .select(vec![
+            col("table_alias.a"),
+            col("b") + col("table_alias.one"),
+        ])?
+        .sort_by_all()?;
     assert_snapshot!(
-        batches_to_sort_string(&df.collect().await.unwrap()),
+        batches_to_string(&df.collect().await.unwrap()),
         @r###"
     +-----------+---------------------------------+
     | a         | table_alias.b + table_alias.one |
@@ -5512,9 +5574,11 @@ async fn test_alias() -> Result<()> {
 async fn test_alias_self_join() -> Result<()> {
     let left = create_test_table("t1").await?;
     let right = left.clone().alias("t2")?;
-    let joined = left.join(right, JoinType::Full, &["a"], &["a"], None)?;
+    let joined = left
+        .join(right, JoinType::Full, &["a"], &["a"], None)?
+        .sort_by_all()?;
     assert_snapshot!(
-        batches_to_sort_string(&joined.collect().await.unwrap()),
+        batches_to_string(&joined.collect().await.unwrap()),
         @r###"
     +-----------+-----+-----------+-----+
     | a         | b   | a         | b   |
@@ -5543,7 +5607,7 @@ async fn test_alias_empty() -> Result<()> {
     "###);
 
     assert_snapshot!(
-        batches_to_sort_string(&df.select(vec![col("a"), col("b")])?.collect().await.unwrap()),
+        batches_to_string(&df.select(vec![col("a"), col("b")])?.sort_by_all()?.collect().await.unwrap()),
         @r###"
     +-----------+-----+
     | a         | b   |
@@ -5582,10 +5646,11 @@ async fn test_alias_nested() -> Result<()> {
     // Select over the aliased DataFrame
     let select1 = df
         .clone()
-        .select(vec![col("alias2.a"), col("b") + col("alias2.one")])?;
+        .select(vec![col("alias2.a"), col("b") + col("alias2.one")])?
+        .sort_by_all()?;
 
     assert_snapshot!(
-        batches_to_sort_string(&select1.collect().await.unwrap()),
+        batches_to_string(&select1.collect().await.unwrap()),
         @r###"
     +-----------+-----------------------+
     | a         | alias2.b + alias2.one |
@@ -5759,9 +5824,9 @@ async fn test_fill_null() -> Result<()> {
             vec!["b".to_string()],
         )?;
 
-    let results = df_filled.collect().await?;
+    let results = df_filled.sort_by_all()?.collect().await?;
     assert_snapshot!(
-        batches_to_sort_string(&results),
+        batches_to_string(&results),
         @r###"
     +---+---------+
     | a | b       |
@@ -5786,17 +5851,17 @@ async fn test_fill_null_all_columns() -> Result<()> {
     let df_filled =
         df.fill_null(ScalarValue::Utf8(Some("default".to_string())), vec![])?;
 
-    let results = df_filled.clone().collect().await?;
+    let results = df_filled.clone().sort_by_all()?.collect().await?;
 
     assert_snapshot!(
-        batches_to_sort_string(&results),
+        batches_to_string(&results),
         @r###"
     +---+---------+
     | a | b       |
     +---+---------+
-    |   | default |
     | 1 | x       |
     | 3 | z       |
+    |   | default |
     +---+---------+
     "###
     );
@@ -5804,9 +5869,9 @@ async fn test_fill_null_all_columns() -> Result<()> {
     // Fill column "a" null values with a value that cannot be cast to Int32.
     let df_filled = df_filled.fill_null(ScalarValue::Int32(Some(0)), vec![])?;
 
-    let results = df_filled.collect().await?;
+    let results = df_filled.sort_by_all()?.collect().await?;
     assert_snapshot!(
-        batches_to_sort_string(&results),
+        batches_to_string(&results),
         @r###"
     +---+---------+
     | a | b       |
