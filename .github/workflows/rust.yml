@@ -339,19 +339,17 @@ jobs:
     name: cargo test doc (amd64)
     needs: linux-build-lib
     runs-on: ubuntu-latest
-    container:
-      image: amd64/rust
     steps:
       - uses: actions/checkout@v4
         with:
           submodules: true
           fetch-depth: 1
       - name: Setup Rust toolchain
-        uses: ./.github/actions/setup-builder
-        with:
-          rust-version: nightly
+        run: rustup toolchain install nightly
       - name: Install cargo-llvm-cov
-        uses: taiki-e/install-action@cargo-llvm-cov
+        run: cargo +nightly install cargo-llvm-cov
+      - name: Install Protobuf Compiler
+        run: sudo apt-get install -y protobuf-compiler
       - name: Run doctests
         run: cargo +nightly llvm-cov --doctests --profile ci --doc --features avro,json
       - name: Upload coverage reports to Codecov
