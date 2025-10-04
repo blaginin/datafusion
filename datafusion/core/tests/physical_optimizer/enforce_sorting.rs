@@ -98,8 +98,6 @@ struct EnforceSortingTest {
     repartition_sorts: bool,
     /// If true, asserts that the input and optimized plans are the same
     expect_no_change: bool,
-    /// A message printed into the snapshot to describe the expected output
-    expected_description: Option<String>,
 }
 
 impl EnforceSortingTest {
@@ -108,7 +106,6 @@ impl EnforceSortingTest {
             plan,
             repartition_sorts: false,
             expect_no_change: false,
-            expected_description: None,
         }
     }
 
@@ -124,11 +121,6 @@ impl EnforceSortingTest {
         self
     }
 
-    /// Add an expected output description
-    fn with_expected_description(mut self, description: &str) -> Self {
-        self.expected_description = Some(description.to_string());
-        self
-    }
 
     /// Runs the enforce sorting test and returns a string with the input and
     /// optimized plan as strings for snapshot comparison using insta
@@ -202,25 +194,18 @@ impl EnforceSortingTest {
             .indent(true)
             .to_string();
 
-        let expected_description =
-            if let Some(desc) = self.expected_description.as_deref() {
-                format!("{desc}\n")
-            } else {
-                "".to_string()
-            };
-
         if self.expect_no_change {
             assert_eq!(input_plan_string, optimized_plan_string,
                        "Expected no change in the plan, but the optimized plan differs from the input plan"
             );
 
             return format!(
-                "{expected_description}Input / Optimized Plan:\n{input_plan_string}",
+                "Input / Optimized Plan:\n{input_plan_string}",
             );
         }
 
         format!(
-                "Input Plan:\n{input_plan_string}\n{expected_description}Optimized Plan:\n{optimized_plan_string}",
+                "Input Plan:\n{input_plan_string}\nOptimized Plan:\n{optimized_plan_string}",
             )
     }
 }
@@ -274,8 +259,8 @@ async fn test_do_not_remove_sort_with_limit() -> Result<()> {
     let physical_plan = sort_preserving_merge_exec(ordering, repartition);
 
     let test = EnforceSortingTest::new(physical_plan)
-        .with_repartition_sorts(true)
-        .with_expected_description("// We should keep the bottom `SortExec`.");
+        .with_repartition_sorts(true);
+
     assert_snapshot!(test.run(), @r"
     Input Plan:
     SortPreservingMergeExec: [nullable_col@0 ASC, non_nullable_col@1 ASC]
@@ -286,7 +271,6 @@ async fn test_do_not_remove_sort_with_limit() -> Result<()> {
             SortExec: expr=[nullable_col@0 ASC, non_nullable_col@1 ASC], preserve_partitioning=[false]
               DataSourceExec: file_groups={1 group: [[x]]}, projection=[nullable_col, non_nullable_col], file_type=parquet
 
-    // We should keep the bottom `SortExec`.
     Optimized Plan:
     SortPreservingMergeExec: [nullable_col@0 ASC, non_nullable_col@1 ASC]
       SortExec: expr=[nullable_col@0 ASC, non_nullable_col@1 ASC], preserve_partitioning=[true]
@@ -297,7 +281,7 @@ async fn test_do_not_remove_sort_with_limit() -> Result<()> {
               SortExec: expr=[nullable_col@0 ASC, non_nullable_col@1 ASC], preserve_partitioning=[false]
                 DataSourceExec: file_groups={1 group: [[x]]}, projection=[nullable_col, non_nullable_col], file_type=parquet
     ");
-
+    // We should keep the bottom `SortExec`.
     Ok(())
 }
 
@@ -314,11 +298,9 @@ async fn test_union_inputs_sorted() -> Result<()> {
     // one input to the union is already sorted, one is not.
     let test = EnforceSortingTest::new(physical_plan)
         .with_repartition_sorts(true)
-        .with_expected_description("// should not add a sort at the output of the union, input plan should not be changed")
         .with_expect_no_change(true);
 
     assert_snapshot!(test.run(), @r"
-    // should not add a sort at the output of the union, input plan should not be changed
     Input / Optimized Plan:
     SortPreservingMergeExec: [nullable_col@0 ASC]
       UnionExec
@@ -326,6 +308,7 @@ async fn test_union_inputs_sorted() -> Result<()> {
         SortExec: expr=[nullable_col@0 ASC], preserve_partitioning=[false]
           DataSourceExec: file_groups={1 group: [[x]]}, projection=[nullable_col, non_nullable_col], file_type=parquet
     ");
+    // should not add a sort at the output of the union, input plan should not be changed
 
     Ok(())
 }
@@ -348,10 +331,8 @@ async fn test_union_inputs_different_sorted() -> Result<()> {
     // one input to the union is already sorted, one is not.
     let test = EnforceSortingTest::new(physical_plan)
         .with_repartition_sorts(true)
-        .with_expected_description("// should not add a sort at the output of the union, input plan should not be changed")
         .with_expect_no_change(true);
     assert_snapshot!(test.run(), @r"
-    // should not add a sort at the output of the union, input plan should not be changed
     Input / Optimized Plan:
     SortPreservingMergeExec: [nullable_col@0 ASC]
       UnionExec
@@ -359,6 +340,7 @@ async fn test_union_inputs_different_sorted() -> Result<()> {
         SortExec: expr=[nullable_col@0 ASC], preserve_partitioning=[false]
           DataSourceExec: file_groups={1 group: [[x]]}, projection=[nullable_col, non_nullable_col], file_type=parquet
     ");
+    // should not add a sort at the output of the union, input plan should not be changed
 
     Ok(())
 }
@@ -422,10 +404,7 @@ async fn test_union_inputs_different_sorted3() -> Result<()> {
     // First input to the union is not Sorted (SortExec is finer than required ordering by the SortPreservingMergeExec above).
     // Second input to the union is already Sorted (matches with the required ordering by the SortPreservingMergeExec above).
     // Third input to the union is not Sorted (SortExec is matches required ordering by the SortPreservingMergeExec above).
-    let test = EnforceSortingTest::new(physical_plan).with_repartition_sorts(true)
-        .with_expected_description(
-            "// should adjust sorting in the first input of the union such that it is not unnecessarily fine"
-        );
+    let test = EnforceSortingTest::new(physical_plan).with_repartition_sorts(true);
 
     assert_snapshot!(test.run(), @r"
     Input Plan:
@@ -437,7 +416,6 @@ async fn test_union_inputs_different_sorted3() -> Result<()> {
         SortExec: expr=[nullable_col@0 ASC], preserve_partitioning=[false]
           DataSourceExec: file_groups={1 group: [[x]]}, projection=[nullable_col, non_nullable_col], file_type=parquet
 
-    // should adjust sorting in the first input of the union such that it is not unnecessarily fine
     Optimized Plan:
     SortPreservingMergeExec: [nullable_col@0 ASC]
       UnionExec
@@ -447,6 +425,7 @@ async fn test_union_inputs_different_sorted3() -> Result<()> {
         SortExec: expr=[nullable_col@0 ASC], preserve_partitioning=[false]
           DataSourceExec: file_groups={1 group: [[x]]}, projection=[nullable_col, non_nullable_col], file_type=parquet
     ");
+    // should adjust sorting in the first input of the union such that it is not unnecessarily fine
     Ok(())
 }
 
@@ -572,11 +551,7 @@ async fn test_union_inputs_different_sorted6() -> Result<()> {
     // The final plan should be valid AND the ordering of the third child
     // shouldn't be finer than necessary.
     let test = EnforceSortingTest::new(physical_plan)
-        .with_repartition_sorts(true)
-        .with_expected_description(
-            "// Should adjust the requirement in the third input of the union so\n\
-        // that it is not unnecessarily fine.",
-        );
+        .with_repartition_sorts(true);
     assert_snapshot!(test.run(), @r"
     Input Plan:
     SortPreservingMergeExec: [nullable_col@0 ASC]
@@ -588,8 +563,6 @@ async fn test_union_inputs_different_sorted6() -> Result<()> {
           RepartitionExec: partitioning=RoundRobinBatch(10), input_partitions=1
             DataSourceExec: file_groups={1 group: [[x]]}, projection=[nullable_col, non_nullable_col], file_type=parquet
 
-    // Should adjust the requirement in the third input of the union so
-    // that it is not unnecessarily fine.
     Optimized Plan:
     SortPreservingMergeExec: [nullable_col@0 ASC]
       UnionExec
@@ -600,6 +573,8 @@ async fn test_union_inputs_different_sorted6() -> Result<()> {
           RepartitionExec: partitioning=RoundRobinBatch(10), input_partitions=1
             DataSourceExec: file_groups={1 group: [[x]]}, projection=[nullable_col, non_nullable_col], file_type=parquet
     ");
+    // Should adjust the requirement in the third input of the union so
+    // that it is not unnecessarily fine.
 
     Ok(())
 }
@@ -620,8 +595,7 @@ async fn test_union_inputs_different_sorted7() -> Result<()> {
     let physical_plan = sort_preserving_merge_exec(ordering2, union);
 
     // Union has unnecessarily fine ordering below it. We should be able to replace them with absolutely necessary ordering.
-    let test = EnforceSortingTest::new(physical_plan).with_repartition_sorts(true)
-        .with_expected_description("// Union preserves the inputs ordering and we should not change any of the SortExecs under UnionExec");
+    let test = EnforceSortingTest::new(physical_plan).with_repartition_sorts(true);
     assert_snapshot!(test.run(), @r"
     Input Plan:
     SortPreservingMergeExec: [nullable_col@0 ASC]
@@ -631,7 +605,6 @@ async fn test_union_inputs_different_sorted7() -> Result<()> {
         SortExec: expr=[nullable_col@0 ASC, non_nullable_col@1 ASC], preserve_partitioning=[false]
           DataSourceExec: file_groups={1 group: [[x]]}, projection=[nullable_col, non_nullable_col], file_type=parquet
 
-    // Union preserves the inputs ordering and we should not change any of the SortExecs under UnionExec
     Optimized Plan:
     SortPreservingMergeExec: [nullable_col@0 ASC]
       UnionExec
@@ -640,6 +613,7 @@ async fn test_union_inputs_different_sorted7() -> Result<()> {
         SortExec: expr=[nullable_col@0 ASC], preserve_partitioning=[false]
           DataSourceExec: file_groups={1 group: [[x]]}, projection=[nullable_col, non_nullable_col], file_type=parquet
     ");
+    // Union preserves the inputs ordering, and we should not change any of the SortExecs under UnionExec
 
     Ok(())
 }
@@ -679,11 +653,7 @@ async fn test_union_inputs_different_sorted8() -> Result<()> {
     // The `UnionExec` doesn't preserve any of the inputs ordering in the
     // example below.
     let test = EnforceSortingTest::new(physical_plan)
-        .with_repartition_sorts(true)
-        .with_expected_description(
-            "// Since `UnionExec` doesn't preserve ordering in the plan above.\n\
-        // We shouldn't keep SortExecs in the plan.",
-        );
+        .with_repartition_sorts(true);
     assert_snapshot!(test.run(), @r"
     Input Plan:
     UnionExec
@@ -692,13 +662,13 @@ async fn test_union_inputs_different_sorted8() -> Result<()> {
       SortExec: expr=[nullable_col@0 DESC NULLS LAST, non_nullable_col@1 DESC NULLS LAST], preserve_partitioning=[false]
         DataSourceExec: file_groups={1 group: [[x]]}, projection=[nullable_col, non_nullable_col], file_type=parquet
 
-    // Since `UnionExec` doesn't preserve ordering in the plan above.
-    // We shouldn't keep SortExecs in the plan.
     Optimized Plan:
     UnionExec
       DataSourceExec: file_groups={1 group: [[x]]}, projection=[nullable_col, non_nullable_col], file_type=parquet
       DataSourceExec: file_groups={1 group: [[x]]}, projection=[nullable_col, non_nullable_col], file_type=parquet
     ");
+    // Since `UnionExec` doesn't preserve ordering in the plan above.
+    // We shouldn't keep SortExecs in the plan.
 
     Ok(())
 }
@@ -1480,10 +1450,8 @@ async fn test_sort_merge_join_complex_order_by() -> Result<()> {
     let physical_plan = sort_preserving_merge_exec(ordering, join.clone());
 
     let test = EnforceSortingTest::new(physical_plan)
-        .with_repartition_sorts(true)
-        .with_expected_description(
-            "// can not push down the sort requirements, need to add SortExec",
-        );
+        .with_repartition_sorts(true);
+
     assert_snapshot!(test.run(), @r"
     Input Plan:
     SortPreservingMergeExec: [col_b@3 ASC, col_a@2 ASC]
@@ -1491,7 +1459,6 @@ async fn test_sort_merge_join_complex_order_by() -> Result<()> {
         DataSourceExec: file_groups={1 group: [[x]]}, projection=[nullable_col, non_nullable_col], file_type=parquet
         DataSourceExec: file_groups={1 group: [[x]]}, projection=[col_a, col_b], file_type=parquet
 
-    // can not push down the sort requirements, need to add SortExec
     Optimized Plan:
     SortExec: expr=[col_b@3 ASC, nullable_col@0 ASC], preserve_partitioning=[false]
       SortMergeJoin: join_type=Inner, on=[(nullable_col@0, col_a@0)]
@@ -1500,6 +1467,7 @@ async fn test_sort_merge_join_complex_order_by() -> Result<()> {
         SortExec: expr=[col_a@0 ASC], preserve_partitioning=[false]
           DataSourceExec: file_groups={1 group: [[x]]}, projection=[col_a, col_b], file_type=parquet
     ");
+    // can not push down the sort requirements, need to add SortExec
 
     // order by (nullable_col, col_b, col_a)
     let ordering2 = [
@@ -1510,10 +1478,8 @@ async fn test_sort_merge_join_complex_order_by() -> Result<()> {
     .into();
     let physical_plan = sort_preserving_merge_exec(ordering2, join);
     let test = EnforceSortingTest::new(physical_plan)
-        .with_repartition_sorts(true)
-        .with_expected_description(
-            "// Can push down the sort requirements since col_a = nullable_col",
-        );
+        .with_repartition_sorts(true);
+
     assert_snapshot!(test.run(), @r"
     Input Plan:
     SortPreservingMergeExec: [nullable_col@0 ASC, col_b@3 ASC, col_a@2 ASC]
@@ -1521,7 +1487,6 @@ async fn test_sort_merge_join_complex_order_by() -> Result<()> {
         DataSourceExec: file_groups={1 group: [[x]]}, projection=[nullable_col, non_nullable_col], file_type=parquet
         DataSourceExec: file_groups={1 group: [[x]]}, projection=[col_a, col_b], file_type=parquet
 
-    // Can push down the sort requirements since col_a = nullable_col
     Optimized Plan:
     SortMergeJoin: join_type=Inner, on=[(nullable_col@0, col_a@0)]
       SortExec: expr=[nullable_col@0 ASC], preserve_partitioning=[false]
@@ -1529,6 +1494,7 @@ async fn test_sort_merge_join_complex_order_by() -> Result<()> {
       SortExec: expr=[col_a@0 ASC, col_b@1 ASC], preserve_partitioning=[false]
         DataSourceExec: file_groups={1 group: [[x]]}, projection=[col_a, col_b], file_type=parquet
     ");
+    // Can push down the sort requirements since col_a = nullable_col
 
     Ok(())
 }
@@ -2501,8 +2467,8 @@ async fn test_push_with_required_input_ordering_allowed() -> Result<()> {
     ];
     */
     let test = EnforceSortingTest::new(plan.clone())
-        .with_repartition_sorts(true)
-        .with_expected_description("// Should be able to push down");
+        .with_repartition_sorts(true);
+
     assert_snapshot!(test.run(), @r"
     Input Plan:
     SortExec: expr=[a@0 ASC, b@1 ASC], preserve_partitioning=[false]
@@ -2510,12 +2476,12 @@ async fn test_push_with_required_input_ordering_allowed() -> Result<()> {
         SortExec: expr=[a@0 ASC], preserve_partitioning=[false]
           DataSourceExec: partitions=1, partition_sizes=[0]
 
-    // Should be able to push down
     Optimized Plan:
     RequiredInputOrderingExec
       SortExec: expr=[a@0 ASC, b@1 ASC], preserve_partitioning=[false]
         DataSourceExec: partitions=1, partition_sizes=[0]
     ");
+    // Should be able to push down
     Ok(())
 }
 
@@ -3955,10 +3921,7 @@ fn test_removes_unused_orthogonal_sort() -> Result<()> {
 
     // Test scenario/input has an orthogonal sort:
     let test = EnforceSortingTest::new(output_sort)
-        .with_repartition_sorts(true)
-        .with_expected_description(
-            "// Test: should remove orthogonal sort, and the uppermost (unneeded) sort:",
-        );
+        .with_repartition_sorts(true);
 
     assert_snapshot!(test.run(), @r"
     Input Plan:
@@ -3966,10 +3929,10 @@ fn test_removes_unused_orthogonal_sort() -> Result<()> {
       SortExec: expr=[a@0 ASC], preserve_partitioning=[false]
         StreamingTableExec: partition_sizes=1, projection=[a, b, c, d, e], infinite_source=true, output_ordering=[b@1 ASC, c@2 ASC]
 
-    // Test: should remove orthogonal sort, and the uppermost (unneeded) sort:
     Optimized Plan:
     StreamingTableExec: partition_sizes=1, projection=[a, b, c, d, e], infinite_source=true, output_ordering=[b@1 ASC, c@2 ASC]
     ");
+    // Test: should remove orthogonal sort, and the uppermost (unneeded) sort:
 
     Ok(())
 }
@@ -3986,22 +3949,20 @@ fn test_keeps_used_orthogonal_sort() -> Result<()> {
 
     // Test scenario/input has an orthogonal sort:
     let test = EnforceSortingTest::new(output_sort)
-        .with_repartition_sorts(true)
-        .with_expected_description(
-            "// Test: should keep the orthogonal sort, since it modifies the output:",
-        );
+        .with_repartition_sorts(true);
     assert_snapshot!(test.run(), @r"
     Input Plan:
     SortExec: expr=[b@1 ASC, c@2 ASC], preserve_partitioning=[false]
       SortExec: TopK(fetch=3), expr=[a@0 ASC], preserve_partitioning=[false]
         StreamingTableExec: partition_sizes=1, projection=[a, b, c, d, e], infinite_source=true, output_ordering=[b@1 ASC, c@2 ASC]
 
-    // Test: should keep the orthogonal sort, since it modifies the output:
     Optimized Plan:
     SortExec: expr=[b@1 ASC, c@2 ASC], preserve_partitioning=[false]
       SortExec: TopK(fetch=3), expr=[a@0 ASC], preserve_partitioning=[false]
         StreamingTableExec: partition_sizes=1, projection=[a, b, c, d, e], infinite_source=true, output_ordering=[b@1 ASC, c@2 ASC]
     ");
+
+    // Test: should keep the orthogonal sort, since it modifies the output:
 
     Ok(())
 }
@@ -4022,8 +3983,7 @@ fn test_handles_multiple_orthogonal_sorts() -> Result<()> {
     let output_sort = sort_exec(input_ordering, orthogonal_sort_3); // final sort
 
     // Test scenario/input has an orthogonal sort:
-    let test = EnforceSortingTest::new(output_sort.clone()).with_repartition_sorts(true)
-        .with_expected_description("// Test: should keep only the needed orthogonal sort, and remove the unneeded ones:");
+    let test = EnforceSortingTest::new(output_sort.clone()).with_repartition_sorts(true);
     assert_snapshot!(test.run(), @r"
     Input Plan:
     SortExec: expr=[b@1 ASC, c@2 ASC], preserve_partitioning=[false]
@@ -4033,12 +3993,13 @@ fn test_handles_multiple_orthogonal_sorts() -> Result<()> {
             SortExec: expr=[c@2 ASC], preserve_partitioning=[false]
               StreamingTableExec: partition_sizes=1, projection=[a, b, c, d, e], infinite_source=true, output_ordering=[b@1 ASC, c@2 ASC]
 
-    // Test: should keep only the needed orthogonal sort, and remove the unneeded ones:
     Optimized Plan:
     SortExec: expr=[b@1 ASC, c@2 ASC], preserve_partitioning=[false]
       SortExec: TopK(fetch=3), expr=[a@0 ASC], preserve_partitioning=[false]
         StreamingTableExec: partition_sizes=1, projection=[a, b, c, d, e], infinite_source=true, output_ordering=[b@1 ASC, c@2 ASC]
     ");
+
+    // Test: should keep only the needed orthogonal sort, and remove the unneeded ones:
     Ok(())
 }
 
