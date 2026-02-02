@@ -19,10 +19,11 @@
     html_logo_url = "https://raw.githubusercontent.com/apache/datafusion/19fe44cf2f30cbdd63d4a4f52c74055163c6cc38/docs/logos/standalone_logo/logo_original.svg",
     html_favicon_url = "https://raw.githubusercontent.com/apache/datafusion/19fe44cf2f30cbdd63d4a4f52c74055163c6cc38/docs/logos/standalone_logo/logo_original.svg"
 )]
-#![cfg_attr(docsrs, feature(doc_auto_cfg))]
+#![cfg_attr(docsrs, feature(doc_cfg))]
 // Make sure fast / cheap clones on Arc are explicit:
 // https://github.com/apache/datafusion/issues/11143
 #![deny(clippy::clone_on_ref_ptr)]
+#![cfg_attr(test, allow(clippy::needless_pass_by_value))]
 
 // Backward compatibility
 pub mod aggregate;
@@ -37,8 +38,8 @@ pub mod intervals;
 mod partitioning;
 mod physical_expr;
 pub mod planner;
+pub mod projection;
 mod scalar_function;
-pub mod schema_rewriter;
 pub mod simplifier;
 pub mod statistics;
 pub mod utils;
@@ -51,15 +52,15 @@ pub mod execution_props {
 }
 
 pub use aggregate::groups_accumulator::{GroupsAccumulatorAdapter, NullState};
-pub use analysis::{analyze, AnalysisContext, ExprBoundaries};
+pub use analysis::{AnalysisContext, ExprBoundaries, analyze};
 pub use equivalence::{
-    calculate_union, AcrossPartitions, ConstExpr, EquivalenceProperties,
+    AcrossPartitions, ConstExpr, EquivalenceProperties, calculate_union,
 };
 pub use partitioning::{Distribution, Partitioning};
 pub use physical_expr::{
-    add_offset_to_expr, add_offset_to_physical_sort_exprs, create_ordering,
-    create_physical_sort_expr, create_physical_sort_exprs, physical_exprs_bag_equal,
-    physical_exprs_contains, physical_exprs_equal,
+    add_offset_to_expr, add_offset_to_physical_sort_exprs, create_lex_ordering,
+    create_ordering, create_physical_sort_expr, create_physical_sort_exprs,
+    physical_exprs_bag_equal, physical_exprs_contains, physical_exprs_equal,
 };
 
 pub use datafusion_physical_expr_common::physical_expr::{PhysicalExpr, PhysicalExprRef};
@@ -70,7 +71,7 @@ pub use datafusion_physical_expr_common::sort_expr::{
 
 pub use planner::{create_physical_expr, create_physical_exprs};
 pub use scalar_function::ScalarFunctionExpr;
-pub use schema_rewriter::DefaultPhysicalExprAdapter;
+pub use simplifier::PhysicalExprSimplifier;
 pub use utils::{conjunction, conjunction_opt, split_conjunction};
 
 // For backwards compatibility

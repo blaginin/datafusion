@@ -20,21 +20,21 @@ use std::cmp::Ordering;
 use std::sync::Arc;
 
 use arrow::array::{ArrayRef, Float32Array, Float64Array, RecordBatch, UInt32Array};
-use arrow::compute::{lexsort_to_indices, take_record_batch, SortColumn, SortOptions};
+use arrow::compute::{SortColumn, SortOptions, lexsort_to_indices, take_record_batch};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion_common::utils::{compare_rows, get_row_at_idx};
-use datafusion_common::{exec_err, plan_err, DataFusionError, Result};
+use datafusion_common::{Result, exec_err, internal_datafusion_err, plan_err};
 use datafusion_expr::sort_properties::{ExprProperties, SortProperties};
 use datafusion_expr::{
     ColumnarValue, ScalarFunctionArgs, ScalarUDFImpl, Signature, Volatility,
 };
 use datafusion_physical_expr::equivalence::{
-    convert_to_orderings, EquivalenceClass, ProjectionMapping,
+    EquivalenceClass, ProjectionMapping, convert_to_orderings,
 };
 use datafusion_physical_expr::{ConstExpr, EquivalenceProperties};
 use datafusion_physical_expr_common::physical_expr::PhysicalExpr;
 use datafusion_physical_expr_common::sort_expr::{LexOrdering, PhysicalSortExpr};
-use datafusion_physical_plan::expressions::{col, Column};
+use datafusion_physical_plan::expressions::{Column, col};
 
 use itertools::izip;
 use rand::prelude::*;
@@ -512,7 +512,7 @@ fn get_sort_columns(
         .collect::<Result<Vec<_>>>()
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 pub struct TestScalarUDF {
     pub(crate) signature: Signature,
 }
@@ -562,11 +562,11 @@ impl ScalarUDFImpl for TestScalarUDF {
             DataType::Float64 => Arc::new({
                 let arg = &args[0].as_any().downcast_ref::<Float64Array>().ok_or_else(
                     || {
-                        DataFusionError::Internal(format!(
+                        internal_datafusion_err!(
                             "could not cast {} to {}",
                             self.name(),
                             std::any::type_name::<Float64Array>()
-                        ))
+                        )
                     },
                 )?;
 
@@ -577,11 +577,11 @@ impl ScalarUDFImpl for TestScalarUDF {
             DataType::Float32 => Arc::new({
                 let arg = &args[0].as_any().downcast_ref::<Float32Array>().ok_or_else(
                     || {
-                        DataFusionError::Internal(format!(
+                        internal_datafusion_err!(
                             "could not cast {} to {}",
                             self.name(),
                             std::any::type_name::<Float32Array>()
-                        ))
+                        )
                     },
                 )?;
 

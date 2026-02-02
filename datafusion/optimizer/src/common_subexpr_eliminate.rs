@@ -27,14 +27,14 @@ use crate::optimizer::ApplyOrder;
 use crate::utils::NamePreserver;
 use datafusion_common::alias::AliasGenerator;
 
-use datafusion_common::cse::{CSEController, FoundCommonNodes, CSE};
+use datafusion_common::cse::{CSE, CSEController, FoundCommonNodes};
 use datafusion_common::tree_node::{Transformed, TreeNode};
-use datafusion_common::{qualified_name, Column, DFSchema, DFSchemaRef, Result};
+use datafusion_common::{Column, DFSchema, DFSchemaRef, Result, qualified_name};
 use datafusion_expr::expr::{Alias, ScalarFunction};
 use datafusion_expr::logical_plan::{
     Aggregate, Filter, LogicalPlan, Projection, Sort, Window,
 };
-use datafusion_expr::{col, BinaryExpr, Case, Expr, Operator, SortExpr};
+use datafusion_expr::{BinaryExpr, Case, Expr, Operator, SortExpr, col};
 
 const CSE_PREFIX: &str = "__common_expr";
 
@@ -316,6 +316,19 @@ impl CommonSubexprEliminate {
                     } => {
                         let rewritten_aggr_expr = new_exprs_list.pop().unwrap();
                         let new_aggr_expr = original_exprs_list.pop().unwrap();
+                        let saved_names = if let Some(aggr_expr) = aggr_expr {
+                            let name_preserver = NamePreserver::new_for_projection();
+                            aggr_expr
+                                .iter()
+                                .map(|expr| Some(name_preserver.save(expr)))
+                                .collect::<Vec<_>>()
+                        } else {
+                            new_aggr_expr
+                                .clone()
+                                .into_iter()
+                                .map(|_| None)
+                                .collect::<Vec<_>>()
+                        };
 
                         let mut agg_exprs = common_exprs
                             .into_iter()
@@ -326,10 +339,19 @@ impl CommonSubexprEliminate {
                         for expr in &new_group_expr {
                             extract_expressions(expr, &mut proj_exprs)
                         }
-                        for (expr_rewritten, expr_orig) in
-                            rewritten_aggr_expr.into_iter().zip(new_aggr_expr)
+                        for ((expr_rewritten, expr_orig), saved_name) in
+                            rewritten_aggr_expr
+                                .into_iter()
+                                .zip(new_aggr_expr)
+                                .zip(saved_names)
                         {
                             if expr_rewritten == expr_orig {
+                                let expr_rewritten = if let Some(saved_name) = saved_name
+                                {
+                                    saved_name.restore(expr_rewritten)
+                                } else {
+                                    expr_rewritten
+                                };
                                 if let Expr::Alias(Alias { expr, name, .. }) =
                                     expr_rewritten
                                 {
@@ -630,10 +652,8 @@ impl CSEController for ExprCSEController<'_> {
             // In case of `ScalarFunction`s we don't know which children are surely
             // executed so start visiting all children conditionally and stop the
             // recursion with `TreeNodeRecursion::Jump`.
-            Expr::ScalarFunction(ScalarFunction { func, args })
-                if func.short_circuits() =>
-            {
-                Some((vec![], args.iter().collect()))
+            Expr::ScalarFunction(ScalarFunction { func, args }) => {
+                func.conditional_arguments(args)
             }
 
             // In case of `And` and `Or` the first child is surely executed, but we
@@ -794,11 +814,11 @@ mod test {
     use std::iter;
 
     use arrow::datatypes::{DataType, Field, Schema};
-    use datafusion_expr::logical_plan::{table_scan, JoinType};
+    use datafusion_expr::logical_plan::{JoinType, table_scan};
     use datafusion_expr::{
-        grouping_set, is_null, not, AccumulatorFactoryFunction, AggregateUDF,
-        ColumnarValue, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature,
-        SimpleAggregateUDF, Volatility,
+        AccumulatorFactoryFunction, AggregateUDF, ColumnarValue, ScalarFunctionArgs,
+        ScalarUDF, ScalarUDFImpl, Signature, SimpleAggregateUDF, Volatility,
+        grouping_set, is_null, not,
     };
     use datafusion_expr::{lit, logical_plan::builder::LogicalPlanBuilder};
 
@@ -1646,7 +1666,7 @@ mod test {
         Ok(())
     }
 
-    #[derive(Debug)]
+    #[derive(Debug, PartialEq, Eq, Hash)]
     pub struct TestUdf {
         signature: Signature,
     }
@@ -1773,7 +1793,7 @@ mod test {
         ScalarUDF::new_from_impl(RandomStub::new())
     }
 
-    #[derive(Debug)]
+    #[derive(Debug, PartialEq, Eq, Hash)]
     struct RandomStub {
         signature: Signature,
     }

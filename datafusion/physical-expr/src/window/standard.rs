@@ -22,17 +22,17 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use super::{StandardWindowFunctionExpr, WindowExpr};
-use crate::window::window_expr::{get_orderby_values, WindowFn};
+use crate::window::window_expr::{WindowFn, get_orderby_values};
 use crate::window::{PartitionBatches, PartitionWindowAggStates, WindowState};
 use crate::{EquivalenceProperties, PhysicalExpr};
 
-use arrow::array::{new_empty_array, ArrayRef};
+use arrow::array::{ArrayRef, new_empty_array};
 use arrow::datatypes::FieldRef;
 use arrow::record_batch::RecordBatch;
 use datafusion_common::utils::evaluate_partition_ranges;
 use datafusion_common::{Result, ScalarValue};
-use datafusion_expr::window_state::{WindowAggState, WindowFrameContext};
 use datafusion_expr::WindowFrame;
+use datafusion_expr::window_state::{WindowAggState, WindowFrameContext};
 use datafusion_physical_expr_common::sort_expr::PhysicalSortExpr;
 
 /// A window expr that takes the form of a [`StandardWindowFunctionExpr`].
@@ -161,6 +161,9 @@ impl WindowExpr for StandardWindowExpr {
         let field = self.expr.field()?;
         let out_type = field.data_type();
         let sort_options = self.order_by.iter().map(|o| o.options).collect::<Vec<_>>();
+        // create a WindowAggState to clone when `window_agg_state` does not contain the respective
+        // group, which is faster than potentially creating a new one at every iteration
+        let new_state = WindowAggState::new(out_type)?;
         for (partition_row, partition_batch_state) in partition_batches.iter() {
             let window_state =
                 if let Some(window_state) = window_agg_state.get_mut(partition_row) {
@@ -170,7 +173,7 @@ impl WindowExpr for StandardWindowExpr {
                     window_agg_state
                         .entry(partition_row.clone())
                         .or_insert(WindowState {
-                            state: WindowAggState::new(out_type)?,
+                            state: new_state.clone(),
                             window_fn: WindowFn::Builtin(evaluator),
                         })
                 };
@@ -235,6 +238,9 @@ impl WindowExpr for StandardWindowExpr {
             }
             let out_col = if row_wise_results.is_empty() {
                 new_empty_array(out_type)
+            } else if row_wise_results.len() == 1 {
+                // fast path when the result only has a single row
+                row_wise_results[0].to_array()?
             } else {
                 ScalarValue::iter_to_array(row_wise_results.into_iter())?
             };

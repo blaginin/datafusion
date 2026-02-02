@@ -48,7 +48,7 @@ async fn csv_query_array_agg_distinct() -> Result<()> {
     let column = actual[0].column(0);
     assert_eq!(column.len(), 1);
     let scalar_vec = ScalarValue::convert_array_to_scalar_vec(&column)?;
-    let mut scalars = scalar_vec[0].clone();
+    let mut scalars = scalar_vec[0].as_ref().unwrap().clone();
 
     // workaround lack of Ord of ScalarValue
     let cmp = |a: &ScalarValue, b: &ScalarValue| {
@@ -365,7 +365,7 @@ async fn count_distinct_dictionary_all_null_values() -> Result<()> {
 
     assert_snapshot!(
         batches_to_string(&results),
-        @r###"
+        @r"
     +-----+---------------+
     | cnt | count(t.num2) |
     +-----+---------------+
@@ -375,7 +375,7 @@ async fn count_distinct_dictionary_all_null_values() -> Result<()> {
     | 0   | 1             |
     | 0   | 1             |
     +-----+---------------+
-    "###
+    "
     );
 
     // Test with multiple partitions
@@ -430,13 +430,13 @@ async fn count_distinct_dictionary_mixed_values() -> Result<()> {
 
     assert_snapshot!(
         batches_to_string(&results),
-        @r###"
+        @r"
     +------------------------+
     | count(DISTINCT t.dict) |
     +------------------------+
     | 2                      |
     +------------------------+
-    "###
+    "
     );
 
     Ok(())

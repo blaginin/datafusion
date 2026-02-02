@@ -18,7 +18,7 @@
 //! Logical Expressions: [`Expr`]
 
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::HashSet;
 use std::fmt::{self, Display, Formatter, Write};
 use std::hash::{Hash, Hasher};
 use std::mem;
@@ -39,10 +39,42 @@ use datafusion_common::{
     Column, DFSchema, HashMap, Result, ScalarValue, Spans, TableReference,
 };
 use datafusion_functions_window_common::field::WindowUDFFieldArgs;
+#[cfg(feature = "sql")]
 use sqlparser::ast::{
-    display_comma_separated, ExceptSelectItem, ExcludeSelectItem, IlikeSelectItem,
-    NullTreatment, RenameSelectItem, ReplaceSelectElement,
+    ExceptSelectItem, ExcludeSelectItem, IlikeSelectItem, RenameSelectItem,
+    ReplaceSelectElement,
 };
+
+// Moved in 51.0.0 to datafusion_common
+pub use datafusion_common::metadata::FieldMetadata;
+use datafusion_common::metadata::ScalarAndMetadata;
+
+// This mirrors sqlparser::ast::NullTreatment but we need our own variant
+// for when the sql feature is disabled.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash, Ord, PartialOrd)]
+pub enum NullTreatment {
+    IgnoreNulls,
+    RespectNulls,
+}
+
+impl Display for NullTreatment {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            NullTreatment::IgnoreNulls => "IGNORE NULLS",
+            NullTreatment::RespectNulls => "RESPECT NULLS",
+        })
+    }
+}
+
+#[cfg(feature = "sql")]
+impl From<sqlparser::ast::NullTreatment> for NullTreatment {
+    fn from(value: sqlparser::ast::NullTreatment) -> Self {
+        match value {
+            sqlparser::ast::NullTreatment::IgnoreNulls => Self::IgnoreNulls,
+            sqlparser::ast::NullTreatment::RespectNulls => Self::RespectNulls,
+        }
+    }
+}
 
 /// Represents logical expressions such as `A + 1`, or `CAST(c1 AS int)`.
 ///
@@ -68,7 +100,7 @@ use sqlparser::ast::{
 ///
 /// # Printing Expressions
 ///
-/// You can print `Expr`s using the the `Debug` trait, `Display` trait, or
+/// You can print `Expr`s using the `Debug` trait, `Display` trait, or
 /// [`Self::human_display`]. See the [examples](#examples-displaying-exprs) below.
 ///
 /// If you need  SQL to pass to other systems, consider using [`Unparser`].
@@ -132,11 +164,11 @@ use sqlparser::ast::{
 /// # use datafusion_expr::{lit, col, Operator, Expr};
 /// // Use the `+` operator to add two columns together
 /// let expr = col("c1") + col("c2");
-/// assert!(matches!(expr, Expr::BinaryExpr { ..} ));
+/// assert!(matches!(expr, Expr::BinaryExpr { .. }));
 /// if let Expr::BinaryExpr(binary_expr) = expr {
-///   assert_eq!(*binary_expr.left, col("c1"));
-///   assert_eq!(*binary_expr.right, col("c2"));
-///   assert_eq!(binary_expr.op, Operator::Plus);
+///     assert_eq!(*binary_expr.left, col("c1"));
+///     assert_eq!(*binary_expr.right, col("c2"));
+///     assert_eq!(binary_expr.op, Operator::Plus);
 /// }
 /// ```
 ///
@@ -147,12 +179,12 @@ use sqlparser::ast::{
 /// # use datafusion_common::ScalarValue;
 /// # use datafusion_expr::{lit, col, Operator, Expr};
 /// let expr = col("c1").eq(lit(42_i32));
-/// assert!(matches!(expr, Expr::BinaryExpr { .. } ));
+/// assert!(matches!(expr, Expr::BinaryExpr { .. }));
 /// if let Expr::BinaryExpr(binary_expr) = expr {
-///   assert_eq!(*binary_expr.left, col("c1"));
-///   let scalar = ScalarValue::Int32(Some(42));
-///   assert_eq!(*binary_expr.right, Expr::Literal(scalar, None));
-///   assert_eq!(binary_expr.op, Operator::Eq);
+///     assert_eq!(*binary_expr.left, col("c1"));
+///     let scalar = ScalarValue::Int32(Some(42));
+///     assert_eq!(*binary_expr.right, Expr::Literal(scalar, None));
+///     assert_eq!(binary_expr.op, Operator::Eq);
 /// }
 /// ```
 ///
@@ -165,22 +197,22 @@ use sqlparser::ast::{
 /// # use datafusion_expr::Expr;
 /// // Create a schema c1(int, c2 float)
 /// let arrow_schema = Schema::new(vec![
-///    Field::new("c1", DataType::Int32, false),
-///    Field::new("c2", DataType::Float64, false),
+///     Field::new("c1", DataType::Int32, false),
+///     Field::new("c2", DataType::Float64, false),
 /// ]);
 /// // DFSchema is a an Arrow schema with optional relation name
-/// let df_schema = DFSchema::try_from_qualified_schema("t1", &arrow_schema)
-///   .unwrap();
+/// let df_schema = DFSchema::try_from_qualified_schema("t1", &arrow_schema).unwrap();
 ///
 /// // Form Vec<Expr> with an expression for each column in the schema
-/// let exprs: Vec<_> = df_schema.iter()
-///   .map(Expr::from)
-///   .collect();
+/// let exprs: Vec<_> = df_schema.iter().map(Expr::from).collect();
 ///
-/// assert_eq!(exprs, vec![
-///   Expr::from(Column::from_qualified_name("t1.c1")),
-///   Expr::from(Column::from_qualified_name("t1.c2")),
-/// ]);
+/// assert_eq!(
+///     exprs,
+///     vec![
+///         Expr::from(Column::from_qualified_name("t1.c1")),
+///         Expr::from(Column::from_qualified_name("t1.c2")),
+///     ]
+/// );
 /// ```
 ///
 /// # Examples: Displaying `Exprs`
@@ -241,12 +273,13 @@ use sqlparser::ast::{
 /// let mut scalars = HashSet::new();
 /// // apply recursively visits all nodes in the expression tree
 /// expr.apply(|e| {
-///    if let Expr::Literal(scalar, _) = e {
-///       scalars.insert(scalar);
-///    }
-///    // The return value controls whether to continue visiting the tree
-///    Ok(TreeNodeRecursion::Continue)
-/// }).unwrap();
+///     if let Expr::Literal(scalar, _) = e {
+///         scalars.insert(scalar);
+///     }
+///     // The return value controls whether to continue visiting the tree
+///     Ok(TreeNodeRecursion::Continue)
+/// })
+/// .unwrap();
 /// // All subtrees have been visited and literals found
 /// assert_eq!(scalars.len(), 2);
 /// assert!(scalars.contains(&ScalarValue::Int32(Some(5))));
@@ -283,7 +316,7 @@ pub enum Expr {
     /// A named reference to a qualified field in a schema.
     Column(Column),
     /// A named reference to a variable in a registry.
-    ScalarVariable(DataType, Vec<String>),
+    ScalarVariable(FieldRef, Vec<String>),
     /// A constant value along with associated [`FieldMetadata`].
     Literal(ScalarValue, Option<FieldMetadata>),
     /// A binary expression such as "age > 21"
@@ -339,6 +372,8 @@ pub enum Expr {
     Exists(Exists),
     /// IN subquery
     InSubquery(InSubquery),
+    /// Set comparison subquery (e.g. `= ANY`, `> ALL`)
+    SetComparison(SetComparison),
     /// Scalar subquery
     ScalarSubquery(Subquery),
     /// Represents a reference to all available fields in a specific schema,
@@ -362,7 +397,7 @@ pub enum Expr {
     Placeholder(Placeholder),
     /// A placeholder which holds a reference to a qualified field
     /// in the outer query, used for correlated sub queries.
-    OuterReferenceColumn(DataType, Column),
+    OuterReferenceColumn(FieldRef, Column),
     /// Unnest expression
     Unnest(Unnest),
 }
@@ -370,6 +405,12 @@ pub enum Expr {
 impl Default for Expr {
     fn default() -> Self {
         Expr::Literal(ScalarValue::Null, None)
+    }
+}
+
+impl AsRef<Expr> for Expr {
+    fn as_ref(&self) -> &Expr {
+        self
     }
 }
 
@@ -384,6 +425,14 @@ impl From<Column> for Expr {
 impl From<WindowFunction> for Expr {
     fn from(value: WindowFunction) -> Self {
         Expr::WindowFunction(Box::new(value))
+    }
+}
+
+/// Create an [`Expr`] from an [`ScalarAndMetadata`]
+impl From<ScalarAndMetadata> for Expr {
+    fn from(value: ScalarAndMetadata) -> Self {
+        let (value, metadata) = value.into_inner();
+        Expr::Literal(value, metadata)
     }
 }
 
@@ -413,190 +462,63 @@ impl<'a> TreeNodeContainer<'a, Self> for Expr {
     }
 }
 
-/// Literal metadata
+/// The metadata used in [`Field::metadata`].
 ///
-/// Stores metadata associated with a literal expressions
-/// and is designed to be fast to `clone`.
+/// This represents the metadata associated with an Arrow [`Field`]. The metadata consists of key-value pairs.
 ///
-/// This structure is used to store metadata associated with a literal expression, and it
-/// corresponds to the `metadata` field on [`Field`].
+/// # Common Use Cases
 ///
-/// # Example: Create [`FieldMetadata`] from a [`Field`]
-/// ```
-/// # use std::collections::HashMap;
-/// # use datafusion_expr::expr::FieldMetadata;
-/// # use arrow::datatypes::{Field, DataType};
-/// # let field = Field::new("c1", DataType::Int32, true)
-/// #  .with_metadata(HashMap::from([("foo".to_string(), "bar".to_string())]));
-/// // Create a new `FieldMetadata` instance from a `Field`
-/// let metadata = FieldMetadata::new_from_field(&field);
-/// // There is also a `From` impl:
-/// let metadata = FieldMetadata::from(&field);
-/// ```
+/// Field metadata is commonly used to store:
+/// - Default values for columns when data is missing
+/// - Column descriptions or documentation
+/// - Data lineage information
+/// - Custom application-specific annotations
+/// - Encoding hints or display formatting preferences
 ///
-/// # Example: Update a [`Field`] with [`FieldMetadata`]
-/// ```
-/// # use datafusion_expr::expr::FieldMetadata;
-/// # use arrow::datatypes::{Field, DataType};
-/// # let field = Field::new("c1", DataType::Int32, true);
-/// # let metadata = FieldMetadata::new_from_field(&field);
-/// // Add any metadata from `FieldMetadata` to `Field`
-/// let updated_field = metadata.add_to_field(field);
-/// ```
+/// # Example: Storing Default Values
 ///
-#[derive(Clone, PartialEq, Eq, PartialOrd, Hash, Debug)]
-pub struct FieldMetadata {
-    /// The inner metadata of a literal expression, which is a map of string
-    /// keys to string values.
-    ///
-    /// Note this is not a `HashMap because `HashMap` does not provide
-    /// implementations for traits like `Debug` and `Hash`.
-    inner: Arc<BTreeMap<String, String>>,
-}
+/// A practical example of using field metadata is storing default values for columns
+/// that may be missing in the physical data but present in the logical schema.
+/// See the [default_column_values.rs] example implementation.
+///
+/// [default_column_values.rs]: https://github.com/apache/datafusion/blob/main/datafusion-examples/examples/custom_data_source/default_column_values.rs
+pub type SchemaFieldMetadata = std::collections::HashMap<String, String>;
 
-impl Default for FieldMetadata {
-    fn default() -> Self {
-        Self::new_empty()
-    }
-}
+/// Intersects multiple metadata instances for UNION operations.
+///
+/// This function implements the intersection strategy used by UNION operations,
+/// where only metadata keys that exist in ALL inputs with identical values
+/// are preserved in the result.
+///
+/// # Union Metadata Behavior
+///
+/// Union operations require consistent metadata across all branches:
+/// - Only metadata keys present in ALL union branches are kept
+/// - For each kept key, the value must be identical across all branches
+/// - If a key has different values across branches, it is excluded from the result
+/// - If any input has no metadata, the result will be empty
+///
+/// # Arguments
+///
+/// * `metadatas` - An iterator of `SchemaFieldMetadata` instances to intersect
+///
+/// # Returns
+///
+/// A new `SchemaFieldMetadata` containing only the intersected metadata
+pub fn intersect_metadata_for_union<'a>(
+    metadatas: impl IntoIterator<Item = &'a SchemaFieldMetadata>,
+) -> SchemaFieldMetadata {
+    let mut metadatas = metadatas.into_iter();
+    let Some(mut intersected) = metadatas.next().cloned() else {
+        return Default::default();
+    };
 
-impl FieldMetadata {
-    /// Create a new empty metadata instance.
-    pub fn new_empty() -> Self {
-        Self {
-            inner: Arc::new(BTreeMap::new()),
-        }
-    }
-
-    /// Merges two optional `FieldMetadata` instances, overwriting any existing
-    /// keys in `m` with keys from `n` if present
-    pub fn merge_options(
-        m: Option<&FieldMetadata>,
-        n: Option<&FieldMetadata>,
-    ) -> Option<FieldMetadata> {
-        match (m, n) {
-            (Some(m), Some(n)) => {
-                let mut merged = m.clone();
-                merged.extend(n.clone());
-                Some(merged)
-            }
-            (Some(m), None) => Some(m.clone()),
-            (None, Some(n)) => Some(n.clone()),
-            (None, None) => None,
-        }
-    }
-
-    /// Create a new metadata instance from a `Field`'s metadata.
-    pub fn new_from_field(field: &Field) -> Self {
-        let inner = field
-            .metadata()
-            .iter()
-            .map(|(k, v)| (k.to_string(), v.to_string()))
-            .collect();
-        Self {
-            inner: Arc::new(inner),
-        }
+    for metadata in metadatas {
+        // Only keep keys that exist in both with the same value
+        intersected.retain(|k, v| metadata.get(k) == Some(v));
     }
 
-    /// Create a new metadata instance from a map of string keys to string values.
-    pub fn new(inner: BTreeMap<String, String>) -> Self {
-        Self {
-            inner: Arc::new(inner),
-        }
-    }
-
-    /// Get the inner metadata as a reference to a `BTreeMap`.
-    pub fn inner(&self) -> &BTreeMap<String, String> {
-        &self.inner
-    }
-
-    /// Return the inner metadata
-    pub fn into_inner(self) -> Arc<BTreeMap<String, String>> {
-        self.inner
-    }
-
-    /// Adds metadata from `other` into `self`, overwriting any existing keys.
-    pub fn extend(&mut self, other: Self) {
-        if other.is_empty() {
-            return;
-        }
-        let other = Arc::unwrap_or_clone(other.into_inner());
-        Arc::make_mut(&mut self.inner).extend(other);
-    }
-
-    /// Returns true if the metadata is empty.
-    pub fn is_empty(&self) -> bool {
-        self.inner.is_empty()
-    }
-
-    /// Returns the number of key-value pairs in the metadata.
-    pub fn len(&self) -> usize {
-        self.inner.len()
-    }
-
-    /// Convert this `FieldMetadata` into a `HashMap<String, String>`
-    pub fn to_hashmap(&self) -> std::collections::HashMap<String, String> {
-        self.inner
-            .iter()
-            .map(|(k, v)| (k.to_string(), v.to_string()))
-            .collect()
-    }
-
-    /// Updates the metadata on the Field with this metadata, if it is not empty.
-    pub fn add_to_field(&self, field: Field) -> Field {
-        if self.inner.is_empty() {
-            return field;
-        }
-
-        field.with_metadata(self.to_hashmap())
-    }
-}
-
-impl From<&Field> for FieldMetadata {
-    fn from(field: &Field) -> Self {
-        Self::new_from_field(field)
-    }
-}
-
-impl From<BTreeMap<String, String>> for FieldMetadata {
-    fn from(inner: BTreeMap<String, String>) -> Self {
-        Self::new(inner)
-    }
-}
-
-impl From<std::collections::HashMap<String, String>> for FieldMetadata {
-    fn from(map: std::collections::HashMap<String, String>) -> Self {
-        Self::new(map.into_iter().collect())
-    }
-}
-
-/// From reference
-impl From<&std::collections::HashMap<String, String>> for FieldMetadata {
-    fn from(map: &std::collections::HashMap<String, String>) -> Self {
-        let inner = map
-            .iter()
-            .map(|(k, v)| (k.to_string(), v.to_string()))
-            .collect();
-        Self::new(inner)
-    }
-}
-
-/// From hashbrown map
-impl From<HashMap<String, String>> for FieldMetadata {
-    fn from(map: HashMap<String, String>) -> Self {
-        let inner = map.into_iter().collect();
-        Self::new(inner)
-    }
-}
-
-impl From<&HashMap<String, String>> for FieldMetadata {
-    fn from(map: &HashMap<String, String>) -> Self {
-        let inner = map
-            .into_iter()
-            .map(|(k, v)| (k.to_string(), v.to_string()))
-            .collect();
-        Self::new(inner)
-    }
+    intersected
 }
 
 /// UNNEST expression.
@@ -646,7 +568,10 @@ impl PartialOrd for Alias {
         let Some(Ordering::Equal) = cmp else {
             return cmp;
         };
-        self.name.partial_cmp(&other.name)
+        self.name
+            .partial_cmp(&other.name)
+            // TODO (https://github.com/apache/datafusion/issues/17477) avoid recomparing all fields
+            .filter(|cmp| *cmp != Ordering::Equal || self == other)
     }
 }
 
@@ -1030,7 +955,7 @@ impl AggregateFunction {
 pub enum WindowFunctionDefinition {
     /// A user defined aggregate function
     AggregateUDF(Arc<AggregateUDF>),
-    /// A user defined aggregate function
+    /// A user defined window function
     WindowUDF(Arc<WindowUDF>),
 }
 
@@ -1039,7 +964,6 @@ impl WindowFunctionDefinition {
     pub fn return_field(
         &self,
         input_expr_fields: &[FieldRef],
-        _input_expr_nullable: &[bool],
         display_name: &str,
     ) -> Result<FieldRef> {
         match self {
@@ -1068,7 +992,7 @@ impl WindowFunctionDefinition {
         }
     }
 
-    /// Return the the inner window simplification function, if any
+    /// Return the inner window simplification function, if any
     ///
     /// See [`WindowFunctionSimplification`] for more information
     pub fn simplify(&self) -> Option<WindowFunctionSimplification> {
@@ -1129,6 +1053,8 @@ pub struct WindowFunctionParams {
     pub order_by: Vec<Sort>,
     /// Window frame
     pub window_frame: WindowFrame,
+    /// Optional filter expression (FILTER (WHERE ...))
+    pub filter: Option<Box<Expr>>,
     /// Specifies how NULL value is treated: ignore or respect
     pub null_treatment: Option<NullTreatment>,
     /// Distinct flag
@@ -1146,13 +1072,14 @@ impl WindowFunction {
                 partition_by: Vec::default(),
                 order_by: Vec::default(),
                 window_frame: WindowFrame::new(None),
+                filter: None,
                 null_treatment: None,
                 distinct: false,
             },
         }
     }
 
-    /// Return the the inner window simplification function, if any
+    /// Return the inner window simplification function, if any
     ///
     /// See [`WindowFunctionSimplification`] for more information
     pub fn simplify(&self) -> Option<WindowFunctionSimplification> {
@@ -1173,6 +1100,54 @@ impl Exists {
     // Create a new Exists expression.
     pub fn new(subquery: Subquery, negated: bool) -> Self {
         Self { subquery, negated }
+    }
+}
+
+/// Whether the set comparison uses `ANY`/`SOME` or `ALL`
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Hash, Debug)]
+pub enum SetQuantifier {
+    /// `ANY` (or `SOME`)
+    Any,
+    /// `ALL`
+    All,
+}
+
+impl Display for SetQuantifier {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            SetQuantifier::Any => write!(f, "ANY"),
+            SetQuantifier::All => write!(f, "ALL"),
+        }
+    }
+}
+
+/// Set comparison subquery (e.g. `= ANY`, `> ALL`)
+#[derive(Clone, PartialEq, Eq, PartialOrd, Hash, Debug)]
+pub struct SetComparison {
+    /// The expression to compare
+    pub expr: Box<Expr>,
+    /// Subquery that will produce a single column of data to compare against
+    pub subquery: Subquery,
+    /// Comparison operator (e.g. `=`, `>`, `<`)
+    pub op: Operator,
+    /// Quantifier (`ANY`/`ALL`)
+    pub quantifier: SetQuantifier,
+}
+
+impl SetComparison {
+    /// Create a new set comparison expression
+    pub fn new(
+        expr: Box<Expr>,
+        subquery: Subquery,
+        op: Operator,
+        quantifier: SetQuantifier,
+    ) -> Self {
+        Self {
+            expr,
+            subquery,
+            op,
+            quantifier,
+        }
     }
 }
 
@@ -1229,13 +1204,22 @@ pub struct Placeholder {
     /// The identifier of the parameter, including the leading `$` (e.g, `"$1"` or `"$foo"`)
     pub id: String,
     /// The type the parameter will be filled in with
-    pub data_type: Option<DataType>,
+    pub field: Option<FieldRef>,
 }
 
 impl Placeholder {
     /// Create a new Placeholder expression
+    #[deprecated(since = "51.0.0", note = "Use new_with_field instead")]
     pub fn new(id: String, data_type: Option<DataType>) -> Self {
-        Self { id, data_type }
+        Self {
+            id,
+            field: data_type.map(|dt| Arc::new(Field::new("", dt, true))),
+        }
+    }
+
+    /// Create a new Placeholder expression from a Field
+    pub fn new_with_field(id: String, field: Option<FieldRef>) -> Self {
+        Self { id, field }
     }
 }
 
@@ -1273,6 +1257,129 @@ impl GroupingSet {
                 }
                 exprs
             }
+        }
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, PartialOrd, Hash, Debug)]
+#[cfg(not(feature = "sql"))]
+pub struct IlikeSelectItem {
+    pub pattern: String,
+}
+#[cfg(not(feature = "sql"))]
+impl Display for IlikeSelectItem {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+        write!(f, "ILIKE '{}'", &self.pattern)?;
+        Ok(())
+    }
+}
+#[derive(Clone, PartialEq, Eq, PartialOrd, Hash, Debug)]
+#[cfg(not(feature = "sql"))]
+pub enum ExcludeSelectItem {
+    Single(Ident),
+    Multiple(Vec<Ident>),
+}
+#[cfg(not(feature = "sql"))]
+impl Display for ExcludeSelectItem {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+        write!(f, "EXCLUDE")?;
+        match self {
+            Self::Single(column) => {
+                write!(f, " {column}")?;
+            }
+            Self::Multiple(columns) => {
+                write!(f, " ({})", display_comma_separated(columns))?;
+            }
+        }
+        Ok(())
+    }
+}
+#[derive(Clone, PartialEq, Eq, PartialOrd, Hash, Debug)]
+#[cfg(not(feature = "sql"))]
+pub struct ExceptSelectItem {
+    pub first_element: Ident,
+    pub additional_elements: Vec<Ident>,
+}
+#[cfg(not(feature = "sql"))]
+impl Display for ExceptSelectItem {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+        write!(f, "EXCEPT ")?;
+        if self.additional_elements.is_empty() {
+            write!(f, "({})", self.first_element)?;
+        } else {
+            write!(
+                f,
+                "({}, {})",
+                self.first_element,
+                display_comma_separated(&self.additional_elements)
+            )?;
+        }
+        Ok(())
+    }
+}
+
+pub fn display_comma_separated<T>(slice: &[T]) -> String
+where
+    T: Display,
+{
+    use itertools::Itertools;
+    slice.iter().map(|v| format!("{v}")).join(", ")
+}
+
+#[derive(Clone, PartialEq, Eq, PartialOrd, Hash, Debug)]
+#[cfg(not(feature = "sql"))]
+pub enum RenameSelectItem {
+    Single(String),
+    Multiple(Vec<String>),
+}
+#[cfg(not(feature = "sql"))]
+impl Display for RenameSelectItem {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+        write!(f, "RENAME")?;
+        match self {
+            Self::Single(column) => {
+                write!(f, " {column}")?;
+            }
+            Self::Multiple(columns) => {
+                write!(f, " ({})", display_comma_separated(columns))?;
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, PartialOrd, Hash, Debug)]
+#[cfg(not(feature = "sql"))]
+pub struct Ident {
+    /// The value of the identifier without quotes.
+    pub value: String,
+    /// The starting quote if any. Valid quote characters are the single quote,
+    /// double quote, backtick, and opening square bracket.
+    pub quote_style: Option<char>,
+    /// The span of the identifier in the original SQL string.
+    pub span: String,
+}
+#[cfg(not(feature = "sql"))]
+impl Display for Ident {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+        write!(f, "[{}]", self.value)
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, PartialOrd, Hash, Debug)]
+#[cfg(not(feature = "sql"))]
+pub struct ReplaceSelectElement {
+    pub expr: String,
+    pub column_name: Ident,
+    pub as_keyword: bool,
+}
+#[cfg(not(feature = "sql"))]
+impl Display for ReplaceSelectElement {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        if self.as_keyword {
+            write!(f, "{} AS {}", self.expr, self.column_name)
+        } else {
+            write!(f, "{} {}", self.expr, self.column_name)
         }
     }
 }
@@ -1445,6 +1552,7 @@ impl Expr {
             Expr::GroupingSet(..) => "GroupingSet",
             Expr::InList { .. } => "InList",
             Expr::InSubquery(..) => "InSubquery",
+            Expr::SetComparison(..) => "SetComparison",
             Expr::IsNotNull(..) => "IsNotNull",
             Expr::IsNull(..) => "IsNull",
             Expr::Like { .. } => "Like",
@@ -1578,12 +1686,11 @@ impl Expr {
     /// ```
     /// # use datafusion_expr::col;
     /// # use std::collections::HashMap;
-    /// # use datafusion_expr::expr::FieldMetadata;
+    /// # use datafusion_common::metadata::FieldMetadata;
     /// let metadata = HashMap::from([("key".to_string(), "value".to_string())]);
     /// let metadata = FieldMetadata::from(metadata);
     /// let expr = col("foo").alias_with_metadata("bar", Some(metadata));
     /// ```
-    ///
     pub fn alias_with_metadata(
         self,
         name: impl Into<String>,
@@ -1610,12 +1717,12 @@ impl Expr {
     /// ```
     /// # use datafusion_expr::col;
     /// # use std::collections::HashMap;
-    /// # use datafusion_expr::expr::FieldMetadata;
+    /// # use datafusion_common::metadata::FieldMetadata;
     /// let metadata = HashMap::from([("key".to_string(), "value".to_string())]);
     /// let metadata = FieldMetadata::from(metadata);
-    /// let expr = col("foo").alias_qualified_with_metadata(Some("tbl"), "bar", Some(metadata));
+    /// let expr =
+    ///     col("foo").alias_qualified_with_metadata(Some("tbl"), "bar", Some(metadata));
     /// ```
-    ///
     pub fn alias_qualified_with_metadata(
         self,
         relation: Option<impl Into<TableReference>>,
@@ -2001,6 +2108,7 @@ impl Expr {
             | Expr::GroupingSet(..)
             | Expr::InList(..)
             | Expr::InSubquery(..)
+            | Expr::SetComparison(..)
             | Expr::IsFalse(..)
             | Expr::IsNotFalse(..)
             | Expr::IsNotNull(..)
@@ -2047,7 +2155,7 @@ impl Expr {
 
 impl Normalizeable for Expr {
     fn can_normalize(&self) -> bool {
-        #[allow(clippy::match_like_matches_macro)]
+        #[expect(clippy::match_like_matches_macro)]
         match self {
             Expr::BinaryExpr(BinaryExpr {
                 op:
@@ -2287,6 +2395,7 @@ impl NormalizeEq for Expr {
                             window_frame: self_window_frame,
                             partition_by: self_partition_by,
                             order_by: self_order_by,
+                            filter: self_filter,
                             null_treatment: self_null_treatment,
                             distinct: self_distinct,
                         },
@@ -2299,6 +2408,7 @@ impl NormalizeEq for Expr {
                             window_frame: other_window_frame,
                             partition_by: other_partition_by,
                             order_by: other_order_by,
+                            filter: other_filter,
                             null_treatment: other_null_treatment,
                             distinct: other_distinct,
                         },
@@ -2306,6 +2416,11 @@ impl NormalizeEq for Expr {
 
                 self_fun.name() == other_fun.name()
                     && self_window_frame == other_window_frame
+                    && match (self_filter, other_filter) {
+                        (Some(a), Some(b)) => a.normalize_eq(b),
+                        (None, None) => true,
+                        _ => false,
+                    }
                     && self_null_treatment == other_null_treatment
                     && self_args.len() == other_args.len()
                     && self_args
@@ -2465,8 +2580,8 @@ impl HashNode for Expr {
             Expr::Column(column) => {
                 column.hash(state);
             }
-            Expr::ScalarVariable(data_type, name) => {
-                data_type.hash(state);
+            Expr::ScalarVariable(field, name) => {
+                field.hash(state);
                 name.hash(state);
             }
             Expr::Literal(scalar_value, _) => {
@@ -2557,12 +2672,14 @@ impl HashNode for Expr {
                             partition_by: _,
                             order_by: _,
                             window_frame,
+                            filter,
                             null_treatment,
                             distinct,
                         },
                 } = window_fun.as_ref();
                 fun.hash(state);
                 window_frame.hash(state);
+                filter.hash(state);
                 null_treatment.hash(state);
                 distinct.hash(state);
             }
@@ -2585,6 +2702,16 @@ impl HashNode for Expr {
                 subquery.hash(state);
                 negated.hash(state);
             }
+            Expr::SetComparison(SetComparison {
+                expr: _,
+                subquery,
+                op,
+                quantifier,
+            }) => {
+                subquery.hash(state);
+                op.hash(state);
+                quantifier.hash(state);
+            }
             Expr::ScalarSubquery(subquery) => {
                 subquery.hash(state);
             }
@@ -2603,8 +2730,8 @@ impl HashNode for Expr {
             Expr::Placeholder(place_holder) => {
                 place_holder.hash(state);
             }
-            Expr::OuterReferenceColumn(data_type, column) => {
-                data_type.hash(state);
+            Expr::OuterReferenceColumn(field, column) => {
+                field.hash(state);
                 column.hash(state);
             }
             Expr::Unnest(Unnest { expr: _expr }) => {}
@@ -2612,23 +2739,26 @@ impl HashNode for Expr {
     }
 }
 
-// Modifies expr if it is a placeholder with datatype of right
+// Modifies expr to match the DataType, metadata, and nullability of other if it is
+// a placeholder with previously unspecified type information (i.e., most placeholders)
 fn rewrite_placeholder(expr: &mut Expr, other: &Expr, schema: &DFSchema) -> Result<()> {
-    if let Expr::Placeholder(Placeholder { id: _, data_type }) = expr {
-        if data_type.is_none() {
-            let other_dt = other.get_type(schema);
-            match other_dt {
-                Err(e) => {
-                    Err(e.context(format!(
-                        "Can not find type of {other} needed to infer type of {expr}"
-                    )))?;
-                }
-                Ok(dt) => {
-                    *data_type = Some(dt);
-                }
+    if let Expr::Placeholder(Placeholder { id: _, field }) = expr
+        && field.is_none()
+    {
+        let other_field = other.to_field(schema);
+        match other_field {
+            Err(e) => {
+                Err(e.context(format!(
+                    "Can not find type of {other} needed to infer type of {expr}"
+                )))?;
             }
-        };
-    }
+            Ok((_, other_field)) => {
+                // We can't infer the nullability of the future parameter that might
+                // be bound, so ensure this is set to true
+                *field = Some(other_field.as_ref().clone().with_nullable(true).into());
+            }
+        }
+    };
     Ok(())
 }
 
@@ -2772,6 +2902,12 @@ impl Display for SchemaDisplay<'_> {
                 write!(f, "NOT IN")
             }
             Expr::InSubquery(InSubquery { negated: false, .. }) => write!(f, "IN"),
+            Expr::SetComparison(SetComparison {
+                expr,
+                op,
+                quantifier,
+                ..
+            }) => write!(f, "{} {op} {quantifier}", SchemaDisplay(expr.as_ref())),
             Expr::IsTrue(expr) => write!(f, "{} IS TRUE", SchemaDisplay(expr)),
             Expr::IsFalse(expr) => write!(f, "{} IS FALSE", SchemaDisplay(expr)),
             Expr::IsNotTrue(expr) => {
@@ -2866,6 +3002,7 @@ impl Display for SchemaDisplay<'_> {
                             partition_by,
                             order_by,
                             window_frame,
+                            filter,
                             null_treatment,
                             distinct,
                         } = params;
@@ -2890,6 +3027,10 @@ impl Display for SchemaDisplay<'_> {
 
                         if let Some(null_treatment) = null_treatment {
                             write!(f, " {null_treatment}")?;
+                        }
+
+                        if let Some(filter) = filter {
+                            write!(f, " FILTER (WHERE {filter})")?;
                         }
 
                         if !partition_by.is_empty() {
@@ -3209,10 +3350,10 @@ impl Display for Expr {
                 write!(f, "END")
             }
             Expr::Cast(Cast { expr, data_type }) => {
-                write!(f, "CAST({expr} AS {data_type:?})")
+                write!(f, "CAST({expr} AS {data_type})")
             }
             Expr::TryCast(TryCast { expr, data_type }) => {
-                write!(f, "TRY_CAST({expr} AS {data_type:?})")
+                write!(f, "TRY_CAST({expr} AS {data_type})")
             }
             Expr::Not(expr) => write!(f, "NOT {expr}"),
             Expr::Negative(expr) => write!(f, "(- {expr})"),
@@ -3242,15 +3383,17 @@ impl Display for Expr {
                 subquery,
                 negated: false,
             }) => write!(f, "{expr} IN ({subquery:?})"),
+            Expr::SetComparison(SetComparison {
+                expr,
+                subquery,
+                op,
+                quantifier,
+            }) => write!(f, "{expr} {op} {quantifier} ({subquery:?})"),
             Expr::ScalarSubquery(subquery) => write!(f, "({subquery:?})"),
             Expr::BinaryExpr(expr) => write!(f, "{expr}"),
             Expr::ScalarFunction(fun) => {
                 fmt_function(f, fun.name(), false, &fun.args, true)
             }
-            // TODO: use udf's display_name, need to fix the separator issue, <https://github.com/apache/datafusion/issues/10364>
-            // Expr::ScalarFunction(ScalarFunction { func, args }) => {
-            //     write!(f, "{}", func.display_name(args).unwrap())
-            // }
             Expr::WindowFunction(window_fun) => {
                 let WindowFunction { fun, params } = window_fun.as_ref();
                 match fun {
@@ -3273,6 +3416,7 @@ impl Display for Expr {
                             partition_by,
                             order_by,
                             window_frame,
+                            filter,
                             null_treatment,
                             distinct,
                         } = params;
@@ -3281,6 +3425,10 @@ impl Display for Expr {
 
                         if let Some(nt) = null_treatment {
                             write!(f, "{nt}")?;
+                        }
+
+                        if let Some(fe) = filter {
+                            write!(f, " FILTER (WHERE {fe})")?;
                         }
 
                         if !partition_by.is_empty() {
@@ -3435,8 +3583,8 @@ pub fn physical_name(expr: &Expr) -> Result<String> {
 mod test {
     use crate::expr_fn::col;
     use crate::{
-        case, lit, qualified_wildcard, wildcard, wildcard_with_options, ColumnarValue,
-        ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Volatility,
+        ColumnarValue, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Volatility, case,
+        lit, placeholder, qualified_wildcard, wildcard, wildcard_with_options,
     };
     use arrow::datatypes::{Field, Schema};
     use sqlparser::ast;
@@ -3450,15 +3598,15 @@ mod test {
         let param_placeholders = vec![
             Expr::Placeholder(Placeholder {
                 id: "$1".to_string(),
-                data_type: None,
+                field: None,
             }),
             Expr::Placeholder(Placeholder {
                 id: "$2".to_string(),
-                data_type: None,
+                field: None,
             }),
             Expr::Placeholder(Placeholder {
                 id: "$3".to_string(),
-                data_type: None,
+                field: None,
             }),
         ];
         let in_list = Expr::InList(InList {
@@ -3484,8 +3632,8 @@ mod test {
                     match expr {
                         Expr::Placeholder(placeholder) => {
                             assert_eq!(
-                                placeholder.data_type,
-                                Some(DataType::Int32),
+                                placeholder.field.unwrap().data_type(),
+                                &DataType::Int32,
                                 "Placeholder {} should infer Int32",
                                 placeholder.id
                             );
@@ -3509,7 +3657,7 @@ mod test {
             expr: Box::new(col("name")),
             pattern: Box::new(Expr::Placeholder(Placeholder {
                 id: "$1".to_string(),
-                data_type: None,
+                field: None,
             })),
             negated: false,
             case_insensitive: false,
@@ -3522,7 +3670,7 @@ mod test {
         match inferred_expr {
             Expr::Like(like) => match *like.pattern {
                 Expr::Placeholder(placeholder) => {
-                    assert_eq!(placeholder.data_type, Some(DataType::Utf8));
+                    assert_eq!(placeholder.field.unwrap().data_type(), &DataType::Utf8);
                 }
                 _ => panic!("Expected Placeholder"),
             },
@@ -3537,8 +3685,8 @@ mod test {
             Expr::SimilarTo(like) => match *like.pattern {
                 Expr::Placeholder(placeholder) => {
                     assert_eq!(
-                        placeholder.data_type,
-                        Some(DataType::Utf8),
+                        placeholder.field.unwrap().data_type(),
+                        &DataType::Utf8,
                         "Placeholder {} should infer Utf8",
                         placeholder.id
                     );
@@ -3546,6 +3694,39 @@ mod test {
                 _ => panic!("Expected Placeholder expression"),
             },
             _ => panic!("Expected SimilarTo expression"),
+        }
+    }
+
+    #[test]
+    fn infer_placeholder_with_metadata() {
+        // name == $1, where name is a non-nullable string
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("name", DataType::Utf8, false).with_metadata(
+                [("some_key".to_string(), "some_value".to_string())].into(),
+            ),
+        ]));
+        let df_schema = DFSchema::try_from(schema).unwrap();
+
+        let expr = binary_expr(col("name"), Operator::Eq, placeholder("$1"));
+
+        let (inferred_expr, _) = expr.infer_placeholder_types(&df_schema).unwrap();
+        match inferred_expr {
+            Expr::BinaryExpr(BinaryExpr { right, .. }) => match *right {
+                Expr::Placeholder(placeholder) => {
+                    assert_eq!(
+                        placeholder.field.as_ref().unwrap().data_type(),
+                        &DataType::Utf8
+                    );
+                    assert_eq!(
+                        placeholder.field.as_ref().unwrap().metadata(),
+                        df_schema.field(0).metadata()
+                    );
+                    // Inferred placeholder should still be nullable
+                    assert!(placeholder.field.as_ref().unwrap().is_nullable());
+                }
+                _ => panic!("Expected Placeholder"),
+            },
+            _ => panic!("Expected BinaryExpr"),
         }
     }
 
@@ -3648,7 +3829,7 @@ mod test {
     #[test]
     fn test_is_volatile_scalar_func() {
         // UDF
-        #[derive(Debug)]
+        #[derive(Debug, PartialEq, Eq, Hash)]
         struct TestScalarUDF {
             signature: Signature,
         }
@@ -3691,6 +3872,7 @@ mod test {
     }
 
     use super::*;
+    use crate::logical_plan::{EmptyRelation, LogicalPlan};
 
     #[test]
     fn test_display_wildcard() {
@@ -3782,6 +3964,28 @@ mod test {
     }
 
     #[test]
+    fn test_display_set_comparison() {
+        let subquery = Subquery {
+            subquery: Arc::new(LogicalPlan::EmptyRelation(EmptyRelation {
+                produce_one_row: false,
+                schema: Arc::new(DFSchema::empty()),
+            })),
+            outer_ref_columns: vec![],
+            spans: Spans::new(),
+        };
+
+        let expr = Expr::SetComparison(SetComparison::new(
+            Box::new(Expr::Column(Column::from_name("a"))),
+            subquery,
+            Operator::Gt,
+            SetQuantifier::Any,
+        ));
+
+        assert_eq!(format!("{expr}"), "a > ANY (<subquery>)");
+        assert_eq!(format!("{}", expr.human_display()), "a > ANY (<subquery>)");
+    }
+
+    #[test]
     fn test_schema_display_alias_with_relation() {
         assert_eq!(
             format!(
@@ -3829,10 +4033,64 @@ mod test {
         // If this test fails when you change `Expr`, please try
         // `Box`ing the fields to make `Expr` smaller
         // See https://github.com/apache/datafusion/issues/16199 for details
-        assert_eq!(size_of::<Expr>(), 128);
+        assert_eq!(size_of::<Expr>(), 112);
         assert_eq!(size_of::<ScalarValue>(), 64);
         assert_eq!(size_of::<DataType>(), 24); // 3 ptrs
         assert_eq!(size_of::<Vec<Expr>>(), 24);
         assert_eq!(size_of::<Arc<Expr>>(), 8);
+    }
+
+    #[test]
+    fn test_accept_exprs() {
+        fn accept_exprs<E: AsRef<Expr>>(_: &[E]) {}
+
+        let expr = || -> Expr { lit(1) };
+
+        // Call accept_exprs with owned expressions
+        let owned_exprs = vec![expr(), expr()];
+        accept_exprs(&owned_exprs);
+
+        // Call accept_exprs with expressions from expr tree
+        let udf = Expr::ScalarFunction(ScalarFunction {
+            func: Arc::new(ScalarUDF::new_from_impl(TestUDF {})),
+            args: vec![expr(), expr()],
+        });
+        let Expr::ScalarFunction(scalar) = &udf else {
+            unreachable!()
+        };
+        accept_exprs(&scalar.args);
+
+        // Call accept_exprs with expressions collected from expr tree, without cloning
+        let mut collected_refs: Vec<&Expr> = scalar.args.iter().collect();
+        collected_refs.extend(&owned_exprs);
+        accept_exprs(&collected_refs);
+
+        // test helpers
+        #[derive(Debug, PartialEq, Eq, Hash)]
+        struct TestUDF {}
+        impl ScalarUDFImpl for TestUDF {
+            fn as_any(&self) -> &dyn Any {
+                unimplemented!()
+            }
+
+            fn name(&self) -> &str {
+                unimplemented!()
+            }
+
+            fn signature(&self) -> &Signature {
+                unimplemented!()
+            }
+
+            fn return_type(&self, _arg_types: &[DataType]) -> Result<DataType> {
+                unimplemented!()
+            }
+
+            fn invoke_with_args(
+                &self,
+                _args: ScalarFunctionArgs,
+            ) -> Result<ColumnarValue> {
+                unimplemented!()
+            }
+        }
     }
 }

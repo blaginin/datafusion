@@ -53,17 +53,16 @@
 //! ```text
 //! c1 > INT32(10)
 //! ```
-//!
 
 use arrow::datatypes::DataType;
-use datafusion_common::{internal_err, tree_node::Transformed};
 use datafusion_common::{Result, ScalarValue};
-use datafusion_expr::{lit, BinaryExpr};
-use datafusion_expr::{simplify::SimplifyInfo, Cast, Expr, Operator, TryCast};
+use datafusion_common::{internal_err, tree_node::Transformed};
+use datafusion_expr::{BinaryExpr, lit};
+use datafusion_expr::{Cast, Expr, Operator, TryCast, simplify::SimplifyContext};
 use datafusion_expr_common::casts::{is_supported_type, try_cast_literal_to_type};
 
-pub(super) fn unwrap_cast_in_comparison_for_binary<S: SimplifyInfo>(
-    info: &S,
+pub(super) fn unwrap_cast_in_comparison_for_binary(
+    info: &SimplifyContext,
     cast_expr: Expr,
     literal: Expr,
     op: Operator,
@@ -90,7 +89,7 @@ pub(super) fn unwrap_cast_in_comparison_for_binary<S: SimplifyInfo>(
             // we need to unwrap the cast for cast/try_cast expr, and add cast to the literal
             let Some(value) = try_cast_literal_to_type(&lit_value, &expr_type) else {
                 return internal_err!(
-                    "Can't cast the literal expr {:?} to type {:?}",
+                    "Can't cast the literal expr {:?} to type {}",
                     &lit_value,
                     &expr_type
                 );
@@ -105,10 +104,8 @@ pub(super) fn unwrap_cast_in_comparison_for_binary<S: SimplifyInfo>(
     }
 }
 
-pub(super) fn is_cast_expr_and_support_unwrap_cast_in_comparison_for_binary<
-    S: SimplifyInfo,
->(
-    info: &S,
+pub(super) fn is_cast_expr_and_support_unwrap_cast_in_comparison_for_binary(
+    info: &SimplifyContext,
     expr: &Expr,
     op: Operator,
     literal: &Expr,
@@ -143,10 +140,8 @@ pub(super) fn is_cast_expr_and_support_unwrap_cast_in_comparison_for_binary<
     }
 }
 
-pub(super) fn is_cast_expr_and_support_unwrap_cast_in_comparison_for_inlist<
-    S: SimplifyInfo,
->(
-    info: &S,
+pub(super) fn is_cast_expr_and_support_unwrap_cast_in_comparison_for_inlist(
+    info: &SimplifyContext,
     expr: &Expr,
     list: &[Expr],
 ) -> bool {
@@ -242,7 +237,6 @@ mod tests {
     use crate::simplify_expressions::ExprSimplifier;
     use arrow::datatypes::{Field, TimeUnit};
     use datafusion_common::{DFSchema, DFSchemaRef};
-    use datafusion_expr::execution_props::ExecutionProps;
     use datafusion_expr::simplify::SimplifyContext;
     use datafusion_expr::{cast, col, in_list, try_cast};
 
@@ -593,9 +587,8 @@ mod tests {
     }
 
     fn optimize_test(expr: Expr, schema: &DFSchemaRef) -> Expr {
-        let props = ExecutionProps::new();
         let simplifier = ExprSimplifier::new(
-            SimplifyContext::new(&props).with_schema(Arc::clone(schema)),
+            SimplifyContext::default().with_schema(Arc::clone(schema)),
         );
 
         simplifier.simplify(expr).unwrap()

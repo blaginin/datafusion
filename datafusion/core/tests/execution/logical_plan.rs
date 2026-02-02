@@ -20,7 +20,7 @@
 
 use arrow::array::Int64Array;
 use arrow::datatypes::{DataType, Field, Schema};
-use datafusion::datasource::{provider_as_source, ViewTable};
+use datafusion::datasource::{ViewTable, provider_as_source};
 use datafusion::execution::session_state::SessionStateBuilder;
 use datafusion_common::{Column, DFSchema, DFSchemaRef, Result, ScalarValue, Spans};
 use datafusion_execution::TaskContext;
@@ -128,7 +128,7 @@ fn inline_scan_projection_test() -> Result<()> {
         @r"
     SubqueryAlias: ?table?
       Projection: a
-        EmptyRelation
+        EmptyRelation: rows=0
     "
     );
 

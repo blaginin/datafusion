@@ -24,14 +24,14 @@ use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
 use std::vec::IntoIter;
 
-use crate::physical_expr::{fmt_sql, PhysicalExpr};
+use crate::physical_expr::{PhysicalExpr, fmt_sql};
 
 use arrow::compute::kernels::sort::{SortColumn, SortOptions};
 use arrow::datatypes::Schema;
 use arrow::record_batch::RecordBatch;
 use datafusion_common::{HashSet, Result};
 use datafusion_expr_common::columnar_value::ColumnarValue;
-
+use indexmap::IndexSet;
 /// Represents Sort operation for a column in a RecordBatch
 ///
 /// Example:
@@ -353,22 +353,34 @@ impl From<PhysicalSortRequirement> for PhysicalSortExpr {
 /// 1. It is non-degenerate, meaning it contains at least one element.
 /// 2. It is duplicate-free, meaning it does not contain multiple entries for
 ///    the same column.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub struct LexOrdering {
     /// Vector of sort expressions representing the lexicographical ordering.
     exprs: Vec<PhysicalSortExpr>,
     /// Set of expressions in the lexicographical ordering, used to ensure
     /// that the ordering is duplicate-free. Note that the elements in this
     /// set are the same underlying physical expressions as in `exprs`.
-    set: HashSet<Arc<dyn PhysicalExpr>>,
+    set: IndexSet<Arc<dyn PhysicalExpr>>,
 }
 
 impl LexOrdering {
     /// Creates a new [`LexOrdering`] from the given vector of sort expressions.
     /// If the vector is empty, returns `None`.
     pub fn new(exprs: impl IntoIterator<Item = PhysicalSortExpr>) -> Option<Self> {
-        let (non_empty, ordering) = Self::construct(exprs);
-        non_empty.then_some(ordering)
+        let exprs = exprs.into_iter();
+        let mut candidate = Self {
+            // not valid yet; valid publicly-returned instance must be non-empty
+            exprs: Vec::new(),
+            set: IndexSet::new(),
+        };
+        for expr in exprs {
+            candidate.push(expr);
+        }
+        if candidate.exprs.is_empty() {
+            None
+        } else {
+            Some(candidate)
+        }
     }
 
     /// Appends an element to the back of the `LexOrdering`.
@@ -409,32 +421,100 @@ impl LexOrdering {
             return false;
         }
         for PhysicalSortExpr { expr, .. } in self.exprs[len..].iter() {
-            self.set.remove(expr);
+            self.set.swap_remove(expr);
         }
         self.exprs.truncate(len);
         true
     }
 
-    /// Constructs a new `LexOrdering` from the given sort requirements w/o
-    /// enforcing non-degeneracy. This function is used internally and is not
-    /// meant (or safe) for external use.
-    fn construct(exprs: impl IntoIterator<Item = PhysicalSortExpr>) -> (bool, Self) {
-        let mut set = HashSet::new();
-        let exprs = exprs
-            .into_iter()
-            .filter_map(|s| set.insert(Arc::clone(&s.expr)).then_some(s))
-            .collect();
-        (!set.is_empty(), Self { exprs, set })
+    /// Check if reversing this ordering would satisfy another ordering requirement.
+    ///
+    /// This supports **prefix matching**: if this ordering is `[A DESC, B ASC]`
+    /// and `other` is `[A ASC]`, reversing this gives `[A ASC, B DESC]`, which
+    /// satisfies `other` since `[A ASC]` is a prefix.
+    ///
+    /// # Arguments
+    /// * `other` - The ordering requirement to check against
+    ///
+    /// # Returns
+    /// `true` if reversing this ordering would satisfy `other`
+    ///
+    /// # Example
+    /// ```text
+    /// self:  [number DESC, letter ASC]
+    /// other: [number ASC]
+    /// After reversing self: [number ASC, letter DESC]  ✓ Prefix match!
+    /// ```
+    pub fn is_reverse(&self, other: &LexOrdering) -> bool {
+        let self_exprs = self.as_ref();
+        let other_exprs = other.as_ref();
+
+        if other_exprs.len() > self_exprs.len() {
+            return false;
+        }
+
+        other_exprs.iter().zip(self_exprs.iter()).all(|(req, cur)| {
+            req.expr.eq(&cur.expr) && is_reversed_sort_options(&req.options, &cur.options)
+        })
+    }
+
+    /// Returns the sort options for the given expression if one is defined in this `LexOrdering`.
+    pub fn get_sort_options(&self, expr: &dyn PhysicalExpr) -> Option<SortOptions> {
+        for e in self {
+            if e.expr.as_ref().dyn_eq(expr) {
+                return Some(e.options);
+            }
+        }
+
+        None
     }
 }
 
+/// Check if two SortOptions represent reversed orderings.
+///
+/// Returns `true` if both `descending` and `nulls_first` are opposite.
+///
+/// # Example
+/// ```
+/// use arrow::compute::SortOptions;
+/// # use datafusion_physical_expr_common::sort_expr::is_reversed_sort_options;
+///
+/// let asc_nulls_last = SortOptions {
+///     descending: false,
+///     nulls_first: false,
+/// };
+/// let desc_nulls_first = SortOptions {
+///     descending: true,
+///     nulls_first: true,
+/// };
+///
+/// assert!(is_reversed_sort_options(&asc_nulls_last, &desc_nulls_first));
+/// assert!(is_reversed_sort_options(&desc_nulls_first, &asc_nulls_last));
+/// ```
+pub fn is_reversed_sort_options(lhs: &SortOptions, rhs: &SortOptions) -> bool {
+    lhs.descending != rhs.descending && lhs.nulls_first != rhs.nulls_first
+}
+
+impl PartialEq for LexOrdering {
+    fn eq(&self, other: &Self) -> bool {
+        let Self {
+            exprs,
+            set: _, // derived from `exprs`
+        } = self;
+        // PartialEq must be consistent with PartialOrd
+        exprs == &other.exprs
+    }
+}
+impl Eq for LexOrdering {}
 impl PartialOrd for LexOrdering {
     /// There is a partial ordering among `LexOrdering` objects. For example, the
     /// ordering `[a ASC]` is coarser (less) than ordering `[a ASC, b ASC]`.
     /// If two orderings do not share a prefix, they are incomparable.
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        self.iter()
-            .zip(other.iter())
+        // PartialEq must be consistent with PartialOrd
+        self.exprs
+            .iter()
+            .zip(other.exprs.iter())
             .all(|(lhs, rhs)| lhs == rhs)
             .then(|| self.len().cmp(&other.len()))
     }
@@ -445,9 +525,8 @@ impl<const N: usize> From<[PhysicalSortExpr; N]> for LexOrdering {
         // TODO: Replace this assertion with a condition on the generic parameter
         //       when Rust supports it.
         assert!(N > 0);
-        let (non_empty, ordering) = Self::construct(value);
-        debug_assert!(non_empty);
-        ordering
+        Self::new(value)
+            .expect("A LexOrdering from non-empty array must be non-degenerate")
     }
 }
 
@@ -604,10 +683,9 @@ impl From<LexOrdering> for LexRequirement {
 
 impl From<LexRequirement> for LexOrdering {
     fn from(value: LexRequirement) -> Self {
-        // Can construct directly as `value` is non-degenerate:
-        let (non_empty, ordering) = Self::construct(value.into_iter().map(Into::into));
-        debug_assert!(non_empty);
-        ordering
+        // Can construct directly as `value` is non-degenerate
+        Self::new(value.into_iter().map(Into::into))
+            .expect("A LexOrdering from LexRequirement must be non-degenerate")
     }
 }
 
@@ -719,5 +797,52 @@ impl DerefMut for OrderingRequirements {
         match self {
             Self::Hard(alts) | Self::Soft(alts) => alts.as_mut_slice(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_is_reversed_sort_options() {
+        // Test basic reversal: ASC NULLS LAST ↔ DESC NULLS FIRST
+        let asc_nulls_last = SortOptions {
+            descending: false,
+            nulls_first: false,
+        };
+        let desc_nulls_first = SortOptions {
+            descending: true,
+            nulls_first: true,
+        };
+        assert!(is_reversed_sort_options(&asc_nulls_last, &desc_nulls_first));
+        assert!(is_reversed_sort_options(&desc_nulls_first, &asc_nulls_last));
+
+        // Test another reversal: ASC NULLS FIRST ↔ DESC NULLS LAST
+        let asc_nulls_first = SortOptions {
+            descending: false,
+            nulls_first: true,
+        };
+        let desc_nulls_last = SortOptions {
+            descending: true,
+            nulls_first: false,
+        };
+        assert!(is_reversed_sort_options(&asc_nulls_first, &desc_nulls_last));
+        assert!(is_reversed_sort_options(&desc_nulls_last, &asc_nulls_first));
+
+        // Test non-reversal: same options
+        assert!(!is_reversed_sort_options(&asc_nulls_last, &asc_nulls_last));
+        assert!(!is_reversed_sort_options(
+            &desc_nulls_first,
+            &desc_nulls_first
+        ));
+
+        // Test non-reversal: only descending differs
+        assert!(!is_reversed_sort_options(&asc_nulls_last, &desc_nulls_last));
+        assert!(!is_reversed_sort_options(&desc_nulls_last, &asc_nulls_last));
+
+        // Test non-reversal: only nulls_first differs
+        assert!(!is_reversed_sort_options(&asc_nulls_last, &asc_nulls_first));
+        assert!(!is_reversed_sort_options(&asc_nulls_first, &asc_nulls_last));
     }
 }

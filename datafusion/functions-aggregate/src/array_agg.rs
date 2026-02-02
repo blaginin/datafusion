@@ -23,20 +23,20 @@ use std::mem::{size_of, size_of_val, take};
 use std::sync::Arc;
 
 use arrow::array::{
-    new_empty_array, Array, ArrayRef, AsArray, BooleanArray, ListArray, StructArray,
+    Array, ArrayRef, AsArray, BooleanArray, ListArray, StructArray, new_empty_array,
 };
-use arrow::compute::{filter, SortOptions};
+use arrow::compute::{SortOptions, filter};
 use arrow::datatypes::{DataType, Field, FieldRef, Fields};
 
 use datafusion_common::cast::as_list_array;
 use datafusion_common::utils::{
-    compare_rows, get_row_at_idx, take_function_args, SingleRowListArrayBuilder,
+    SingleRowListArrayBuilder, compare_rows, get_row_at_idx, take_function_args,
 };
-use datafusion_common::{exec_err, internal_err, Result, ScalarValue};
+use datafusion_common::{Result, ScalarValue, assert_eq_or_internal_err, exec_err};
 use datafusion_expr::function::{AccumulatorArgs, StateFieldsArgs};
 use datafusion_expr::utils::format_state_name;
 use datafusion_expr::{
-    udf_equals_hash, Accumulator, AggregateUDFImpl, Documentation, Signature, Volatility,
+    Accumulator, AggregateUDFImpl, Documentation, Signature, Volatility,
 };
 use datafusion_functions_aggregate_common::merge_arrays::merge_ordered_arrays;
 use datafusion_functions_aggregate_common::order::AggregateOrderSensitivity;
@@ -113,22 +113,26 @@ impl AggregateUDFImpl for ArrayAgg {
 
     fn state_fields(&self, args: StateFieldsArgs) -> Result<Vec<FieldRef>> {
         if args.is_distinct {
-            return Ok(vec![Field::new_list(
-                format_state_name(args.name, "distinct_array_agg"),
+            return Ok(vec![
+                Field::new_list(
+                    format_state_name(args.name, "distinct_array_agg"),
+                    // See COMMENTS.md to understand why nullable is set to true
+                    Field::new_list_field(args.input_fields[0].data_type().clone(), true),
+                    true,
+                )
+                .into(),
+            ]);
+        }
+
+        let mut fields = vec![
+            Field::new_list(
+                format_state_name(args.name, "array_agg"),
                 // See COMMENTS.md to understand why nullable is set to true
                 Field::new_list_field(args.input_fields[0].data_type().clone(), true),
                 true,
             )
-            .into()]);
-        }
-
-        let mut fields = vec![Field::new_list(
-            format_state_name(args.name, "array_agg"),
-            // See COMMENTS.md to understand why nullable is set to true
-            Field::new_list_field(args.input_fields[0].data_type().clone(), true),
-            true,
-        )
-        .into()];
+            .into(),
+        ];
 
         if args.ordering_fields.is_empty() {
             return Ok(fields);
@@ -162,9 +166,9 @@ impl AggregateUDFImpl for ArrayAgg {
     }
 
     fn accumulator(&self, acc_args: AccumulatorArgs) -> Result<Box<dyn Accumulator>> {
-        let data_type = acc_args.exprs[0].data_type(acc_args.schema)?;
-        let ignore_nulls =
-            acc_args.ignore_nulls && acc_args.exprs[0].nullable(acc_args.schema)?;
+        let field = &acc_args.expr_fields[0];
+        let data_type = field.data_type();
+        let ignore_nulls = acc_args.ignore_nulls && field.is_nullable();
 
         if acc_args.is_distinct {
             // Limitation similar to Postgres. The aggregation function can only mix
@@ -191,7 +195,7 @@ impl AggregateUDFImpl for ArrayAgg {
                 }
             };
             return Ok(Box::new(DistinctArrayAggAccumulator::try_new(
-                &data_type,
+                data_type,
                 sort_option,
                 ignore_nulls,
             )?));
@@ -199,7 +203,7 @@ impl AggregateUDFImpl for ArrayAgg {
 
         let Some(ordering) = LexOrdering::new(acc_args.order_bys.to_vec()) else {
             return Ok(Box::new(ArrayAggAccumulator::try_new(
-                &data_type,
+                data_type,
                 ignore_nulls,
             )?));
         };
@@ -210,7 +214,7 @@ impl AggregateUDFImpl for ArrayAgg {
             .collect::<Result<Vec<_>>>()?;
 
         OrderSensitiveArrayAggAccumulator::try_new(
-            &data_type,
+            data_type,
             &ordering_dtypes,
             ordering,
             self.is_input_pre_ordered,
@@ -224,11 +228,13 @@ impl AggregateUDFImpl for ArrayAgg {
         datafusion_expr::ReversedUDAF::Reversed(array_agg_udaf())
     }
 
+    fn supports_null_handling_clause(&self) -> bool {
+        true
+    }
+
     fn documentation(&self) -> Option<&Documentation> {
         self.doc()
     }
-
-    udf_equals_hash!(AggregateUDFImpl);
 }
 
 #[derive(Debug)]
@@ -317,9 +323,7 @@ impl Accumulator for ArrayAggAccumulator {
             return Ok(());
         }
 
-        if values.len() != 1 {
-            return internal_err!("expects single batch");
-        }
+        assert_eq_or_internal_err!(values.len(), 1, "expects single batch");
 
         let val = &values[0];
         let nulls = if self.ignore_nulls {
@@ -347,9 +351,7 @@ impl Accumulator for ArrayAggAccumulator {
             return Ok(());
         }
 
-        if states.len() != 1 {
-            return internal_err!("expects single state");
-        }
+        assert_eq_or_internal_err!(states.len(), 1, "expects single state");
 
         let list_arr = as_list_array(&states[0])?;
 
@@ -413,7 +415,7 @@ impl Accumulator for ArrayAggAccumulator {
 }
 
 #[derive(Debug)]
-struct DistinctArrayAggAccumulator {
+pub struct DistinctArrayAggAccumulator {
     values: HashSet<ScalarValue>,
     datatype: DataType,
     sort_options: Option<SortOptions>,
@@ -470,9 +472,7 @@ impl Accumulator for DistinctArrayAggAccumulator {
             return Ok(());
         }
 
-        if states.len() != 1 {
-            return internal_err!("expects single state");
-        }
+        assert_eq_or_internal_err!(states.len(), 1, "expects single state");
 
         states[0]
             .as_list::<i32>()
@@ -689,13 +689,16 @@ impl Accumulator for OrderSensitiveArrayAggAccumulator {
 
         // Convert array to Scalars to sort them easily. Convert back to array at evaluation.
         let array_agg_res = ScalarValue::convert_array_to_scalar_vec(array_agg_values)?;
-        for v in array_agg_res.into_iter() {
-            partition_values.push(v.into());
+        for maybe_v in array_agg_res.into_iter() {
+            if let Some(v) = maybe_v {
+                partition_values.push(v.into());
+            } else {
+                partition_values.push(vec![].into());
+            }
         }
 
         let orderings = ScalarValue::convert_array_to_scalar_vec(agg_orderings)?;
-
-        for partition_ordering_rows in orderings.into_iter() {
+        for partition_ordering_rows in orderings.into_iter().flatten() {
             // Extract value from struct to ordering_rows for each group/partition
             let ordering_value = partition_ordering_rows.into_iter().map(|ordering_row| {
                     if let ScalarValue::Struct(s) = ordering_row {
@@ -800,6 +803,7 @@ mod tests {
     use arrow::datatypes::{FieldRef, Schema};
     use datafusion_common::cast::as_generic_string_array;
     use datafusion_common::internal_err;
+    use datafusion_physical_expr::PhysicalExpr;
     use datafusion_physical_expr::expressions::Column;
     use datafusion_physical_expr_common::sort_expr::PhysicalSortExpr;
     use std::sync::Arc;
@@ -1107,7 +1111,7 @@ mod tests {
         ])])?;
 
         // without compaction, the size is 17112
-        assert_eq!(acc.size(), 2112);
+        assert_eq!(acc.size(), 2224);
 
         Ok(())
     }
@@ -1158,15 +1162,18 @@ mod tests {
         }
 
         fn build(&self) -> Result<Box<dyn Accumulator>> {
+            let expr = Arc::new(Column::new("col", 0));
+            let expr_field = expr.return_field(&self.schema)?;
             ArrayAgg::default().accumulator(AccumulatorArgs {
                 return_field: Arc::clone(&self.return_field),
                 schema: &self.schema,
+                expr_fields: &[expr_field],
                 ignore_nulls: false,
                 order_bys: &self.order_bys,
                 is_reversed: false,
                 name: "",
                 is_distinct: self.distinct,
-                exprs: &[Arc::new(Column::new("col", 0))],
+                exprs: &[expr],
             })
         }
 

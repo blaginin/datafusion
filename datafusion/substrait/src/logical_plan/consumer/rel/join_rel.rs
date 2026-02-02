@@ -16,14 +16,14 @@
 // under the License.
 
 use crate::logical_plan::consumer::SubstraitConsumer;
-use datafusion::common::{not_impl_err, plan_err, Column, JoinType, NullEquality};
+use datafusion::common::{Column, JoinType, NullEquality, not_impl_err, plan_err};
 use datafusion::logical_expr::requalify_sides_if_needed;
 use datafusion::logical_expr::utils::split_conjunction;
 use datafusion::logical_expr::{
     BinaryExpr, Expr, LogicalPlan, LogicalPlanBuilder, Operator,
 };
 
-use substrait::proto::{join_rel, JoinRel};
+use substrait::proto::{JoinRel, join_rel};
 
 pub async fn from_join_rel(
     consumer: &impl SubstraitConsumer,
@@ -98,7 +98,7 @@ fn split_eq_and_noneq_join_predicate_with_nulls_equality(
     let mut nulls_equal_nulls = false;
 
     for expr in exprs {
-        #[allow(clippy::collapsible_match)]
+        #[expect(clippy::collapsible_match)]
         match expr {
             Expr::BinaryExpr(binary_expr) => match binary_expr {
                 x @ (BinaryExpr {
@@ -145,9 +145,11 @@ fn from_substrait_jointype(join_type: i32) -> datafusion::common::Result<JoinTyp
             join_rel::JoinType::LeftSemi => Ok(JoinType::LeftSemi),
             join_rel::JoinType::LeftMark => Ok(JoinType::LeftMark),
             join_rel::JoinType::RightMark => Ok(JoinType::RightMark),
+            join_rel::JoinType::RightAnti => Ok(JoinType::RightAnti),
+            join_rel::JoinType::RightSemi => Ok(JoinType::RightSemi),
             _ => plan_err!("unsupported join type {substrait_join_type:?}"),
         }
     } else {
-        plan_err!("invalid join type variant {join_type:?}")
+        plan_err!("invalid join type variant {join_type}")
     }
 }

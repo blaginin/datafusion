@@ -25,24 +25,23 @@ use arrow::array::{ArrayRef, AsArray};
 use arrow::buffer::Buffer;
 use arrow::csv::WriterBuilder;
 use arrow::datatypes::{
-    i256, DataType, Field, IntervalDayTimeType, IntervalMonthDayNanoType, IntervalUnit,
-    Schema, TimeUnit, UnionFields, UnionMode,
+    DataType, Field, IntervalDayTimeType, IntervalMonthDayNanoType, IntervalUnit, Schema,
+    TimeUnit, UnionFields, UnionMode, i256,
 };
 use arrow::ipc::{reader::read_record_batch, root_as_message};
 
 use datafusion_common::{
+    Column, ColumnStatistics, Constraint, Constraints, DFSchema, DFSchemaRef,
+    DataFusionError, JoinSide, ScalarValue, Statistics, TableReference,
     arrow_datafusion_err,
     config::{
         CsvOptions, JsonOptions, ParquetColumnOptions, ParquetOptions,
         TableParquetOptions,
     },
     file_options::{csv_writer::CsvWriterOptions, json_writer::JsonWriterOptions},
-    not_impl_err,
     parsers::CompressionTypeVariant,
     plan_datafusion_err,
     stats::Precision,
-    Column, ColumnStatistics, Constraint, Constraints, DFSchema, DFSchemaRef,
-    DataFusionError, JoinSide, ScalarValue, Statistics, TableReference,
 };
 
 #[derive(Debug)]
@@ -139,11 +138,17 @@ where
     }
 }
 
+impl From<protobuf::ColumnRelation> for TableReference {
+    fn from(rel: protobuf::ColumnRelation) -> Self {
+        Self::parse_str_normalized(rel.relation.as_str(), true)
+    }
+}
+
 impl From<protobuf::Column> for Column {
     fn from(c: protobuf::Column) -> Self {
         let protobuf::Column { relation, name } = c;
 
-        Self::new(relation.map(|r| r.relation), name)
+        Self::new(relation, name)
     }
 }
 
@@ -165,10 +170,7 @@ impl TryFrom<&protobuf::DfSchema> for DFSchema {
             .map(|df_field| {
                 let field: Field = df_field.field.as_ref().required("field")?;
                 Ok((
-                    df_field
-                        .qualifier
-                        .as_ref()
-                        .map(|q| q.relation.clone().into()),
+                    df_field.qualifier.as_ref().map(|q| q.clone().into()),
                     Arc::new(field),
                 ))
             })
@@ -302,13 +304,16 @@ impl TryFrom<&protobuf::arrow_type::ArrowTypeEnum> for DataType {
                 };
                 let union_fields = parse_proto_fields_to_fields(&union.union_types)?;
 
-                // Default to index based type ids if not provided
-                let type_ids: Vec<_> = match union.type_ids.is_empty() {
-                    true => (0..union_fields.len() as i8).collect(),
-                    false => union.type_ids.iter().map(|i| *i as i8).collect(),
+                // Default to index based type ids if not explicitly provided
+                let union_fields = if union.type_ids.is_empty() {
+                    UnionFields::from_fields(union_fields)
+                } else {
+                    let type_ids = union.type_ids.iter().map(|i| *i as i8);
+                    UnionFields::try_new(type_ids, union_fields).map_err(|e| {
+                        DataFusionError::from(e).context("Deserializing Union DataType")
+                    })?
                 };
-
-                DataType::Union(UnionFields::new(type_ids, union_fields), union_mode)
+                DataType::Union(union_fields, union_mode)
             }
             arrow_type::ArrowTypeEnum::Dictionary(dict) => {
                 let key_datatype = dict.as_ref().key.as_deref().required("key")?;
@@ -478,13 +483,13 @@ impl TryFrom<&protobuf::ScalarValue> for ScalarValue {
                 let null_type: DataType = v.try_into()?;
                 null_type.try_into().map_err(Error::DataFusionError)?
             }
-            Value::Decimal32Value(_val) => {
-                return not_impl_err!("Decimal32 protobuf deserialization")
-                    .map_err(Error::DataFusionError)
+            Value::Decimal32Value(val) => {
+                let array = vec_to_array(val.value.clone());
+                Self::Decimal32(Some(i32::from_be_bytes(array)), val.p as u8, val.s as i8)
             }
-            Value::Decimal64Value(_val) => {
-                return not_impl_err!("Decimal64 protobuf deserialization")
-                    .map_err(Error::DataFusionError)
+            Value::Decimal64Value(val) => {
+                let array = vec_to_array(val.value.clone());
+                Self::Decimal64(Some(i64::from_be_bytes(array)), val.p as u8, val.s as i8)
             }
             Value::Decimal128Value(val) => {
                 let array = vec_to_array(val.value.clone());
@@ -600,7 +605,9 @@ impl TryFrom<&protobuf::ScalarValue> for ScalarValue {
                     .collect::<Option<Vec<_>>>();
                 let fields = fields.ok_or_else(|| Error::required("UnionField"))?;
                 let fields = parse_proto_fields_to_fields(&fields)?;
-                let fields = UnionFields::new(ids, fields);
+                let union_fields = UnionFields::try_new(ids, fields).map_err(|e| {
+                    DataFusionError::from(e).context("Deserializing Union ScalarValue")
+                })?;
                 let v_id = val.value_id as i8;
                 let val = match &val.value {
                     None => None,
@@ -612,7 +619,7 @@ impl TryFrom<&protobuf::ScalarValue> for ScalarValue {
                         Some((v_id, Box::new(val)))
                     }
                 };
-                Self::Union(val, fields, mode)
+                Self::Union(val, union_fields, mode)
             }
             Value::FixedSizeBinaryValue(v) => {
                 Self::FixedSizeBinary(v.length, Some(v.clone().values))
@@ -694,6 +701,11 @@ impl From<&protobuf::ColumnStats> for ColumnStatistics {
             },
             distinct_count: if let Some(dc) = &cs.distinct_count {
                 dc.clone().into()
+            } else {
+                Precision::Absent
+            },
+            byte_size: if let Some(sbs) = &cs.byte_size {
+                sbs.clone().into()
             } else {
                 Precision::Absent
             },
@@ -898,9 +910,10 @@ impl TryFrom<&protobuf::CsvOptions> for CsvOptions {
             quote: proto_opts.quote[0],
             terminator: proto_opts.terminator.first().copied(),
             escape: proto_opts.escape.first().copied(),
-            double_quote: proto_opts.has_header.first().map(|h| *h != 0),
+            double_quote: proto_opts.double_quote.first().map(|h| *h != 0),
             newlines_in_values: proto_opts.newlines_in_values.first().map(|h| *h != 0),
             compression: proto_opts.compression().into(),
+            compression_level: proto_opts.compression_level,
             schema_infer_max_rec: proto_opts.schema_infer_max_rec.map(|h| h as usize),
             date_format: (!proto_opts.date_format.is_empty())
                 .then(|| proto_opts.date_format.clone()),
@@ -917,6 +930,7 @@ impl TryFrom<&protobuf::CsvOptions> for CsvOptions {
             null_regex: (!proto_opts.null_regex.is_empty())
                 .then(|| proto_opts.null_regex.clone()),
             comment: proto_opts.comment.first().copied(),
+            truncated_rows: proto_opts.truncated_rows.first().map(|h| *h != 0),
         })
     }
 }
@@ -927,7 +941,6 @@ impl TryFrom<&protobuf::ParquetOptions> for ParquetOptions {
     fn try_from(
         value: &protobuf::ParquetOptions,
     ) -> datafusion_common::Result<Self, Self::Error> {
-        #[allow(deprecated)] // max_statistics_size
         Ok(ParquetOptions {
             enable_page_index: value.enable_page_index,
             pruning: value.pruning,
@@ -940,9 +953,12 @@ impl TryFrom<&protobuf::ParquetOptions> for ParquetOptions {
                 .unwrap_or(None),
             pushdown_filters: value.pushdown_filters,
             reorder_filters: value.reorder_filters,
+            force_filter_selections: value.force_filter_selections,
             data_pagesize_limit: value.data_pagesize_limit as usize,
             write_batch_size: value.write_batch_size as usize,
-            writer_version: value.writer_version.clone(),
+            writer_version: value.writer_version.parse().map_err(|e| {
+                DataFusionError::Internal(format!("Failed to parse writer_version: {e}"))
+            })?,
             compression: value.compression_opt.clone().map(|opt| match opt {
                 protobuf::parquet_options::CompressionOpt::Compression(v) => Some(v),
             }).unwrap_or(None),
@@ -999,6 +1015,9 @@ impl TryFrom<&protobuf::ParquetOptions> for ParquetOptions {
                 protobuf::parquet_options::CoerceInt96Opt::CoerceInt96(v) => Some(v),
             }).unwrap_or(None),
             skip_arrow_metadata: value.skip_arrow_metadata,
+            max_predicate_cache_size: value.max_predicate_cache_size_opt.map(|opt| match opt {
+                protobuf::parquet_options::MaxPredicateCacheSizeOpt::MaxPredicateCacheSize(v) => Some(v as usize),
+            }).unwrap_or(None),
         })
     }
 }
@@ -1008,7 +1027,6 @@ impl TryFrom<&protobuf::ParquetColumnOptions> for ParquetColumnOptions {
     fn try_from(
         value: &protobuf::ParquetColumnOptions,
     ) -> datafusion_common::Result<Self, Self::Error> {
-        #[allow(deprecated)] // max_statistics_size
         Ok(ParquetColumnOptions {
             compression: value.compression_opt.clone().map(|opt| match opt {
                 protobuf::parquet_column_options::CompressionOpt::Compression(v) => Some(v),
@@ -1085,6 +1103,7 @@ impl TryFrom<&protobuf::JsonOptions> for JsonOptions {
         let compression: protobuf::CompressionTypeVariant = proto_opts.compression();
         Ok(JsonOptions {
             compression: compression.into(),
+            compression_level: proto_opts.compression_level,
             schema_infer_max_rec: proto_opts.schema_infer_max_rec.map(|h| h as usize),
         })
     }

@@ -23,7 +23,7 @@ use std::{any::Any, borrow::Cow};
 use crate::TableProvider;
 
 use arrow::datatypes::SchemaRef;
-use datafusion_common::{internal_err, Constraints};
+use datafusion_common::{Constraints, internal_err};
 use datafusion_expr::{Expr, TableProviderFilterPushDown, TableSource, TableType};
 
 /// Implements [`TableSource`] for a [`TableProvider`]
@@ -76,7 +76,7 @@ impl TableSource for DefaultTableSource {
         self.table_provider.supports_filters_pushdown(filter)
     }
 
-    fn get_logical_plan(&self) -> Option<Cow<datafusion_expr::LogicalPlan>> {
+    fn get_logical_plan(&'_ self) -> Option<Cow<'_, datafusion_expr::LogicalPlan>> {
         self.table_provider.get_logical_plan()
     }
 

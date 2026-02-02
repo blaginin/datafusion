@@ -15,14 +15,14 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::logical_plan::producer::{make_binary_op_scalar_func, SubstraitProducer};
+use crate::logical_plan::producer::{SubstraitProducer, make_binary_op_scalar_func};
 use datafusion::common::{
-    not_impl_err, DFSchemaRef, JoinConstraint, JoinType, NullEquality,
+    DFSchemaRef, JoinConstraint, JoinType, NullEquality, not_impl_err,
 };
 use datafusion::logical_expr::{Expr, Join, Operator};
 use std::sync::Arc;
 use substrait::proto::rel::RelType;
-use substrait::proto::{join_rel, Expression, JoinRel, Rel};
+use substrait::proto::{Expression, JoinRel, Rel, join_rel};
 
 pub fn from_join(
     producer: &mut impl SubstraitProducer,
@@ -115,8 +115,7 @@ fn to_substrait_jointype(join_type: JoinType) -> join_rel::JoinType {
         JoinType::LeftSemi => join_rel::JoinType::LeftSemi,
         JoinType::LeftMark => join_rel::JoinType::LeftMark,
         JoinType::RightMark => join_rel::JoinType::RightMark,
-        JoinType::RightAnti | JoinType::RightSemi => {
-            unimplemented!()
-        }
+        JoinType::RightAnti => join_rel::JoinType::RightAnti,
+        JoinType::RightSemi => join_rel::JoinType::RightSemi,
     }
 }

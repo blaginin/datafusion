@@ -17,6 +17,7 @@
 
 pub mod aggregate;
 pub mod array;
+pub mod bitmap;
 pub mod bitwise;
 pub mod collection;
 pub mod conditional;
@@ -32,6 +33,7 @@ pub mod lambda;
 pub mod map;
 pub mod math;
 pub mod misc;
+mod null_utils;
 pub mod predicate;
 pub mod string;
 pub mod r#struct;

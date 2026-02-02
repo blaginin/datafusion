@@ -17,45 +17,52 @@
 
 //! Expression simplification API
 
-use std::borrow::Cow;
-use std::collections::HashSet;
-use std::ops::Not;
-
 use arrow::{
-    array::{new_null_array, AsArray},
+    array::{Array, AsArray, new_null_array},
     datatypes::{DataType, Field, Schema},
     record_batch::RecordBatch,
 };
+use std::borrow::Cow;
+use std::collections::HashSet;
+use std::ops::Not;
+use std::sync::Arc;
 
+use datafusion_common::config::ConfigOptions;
 use datafusion_common::{
+    DFSchema, DataFusionError, Result, ScalarValue, exec_datafusion_err, internal_err,
+};
+use datafusion_common::{
+    HashMap,
     cast::{as_large_list_array, as_list_array},
+    metadata::FieldMetadata,
     tree_node::{Transformed, TransformedResult, TreeNode, TreeNodeRewriter},
 };
-use datafusion_common::{internal_err, DFSchema, DataFusionError, Result, ScalarValue};
 use datafusion_expr::{
-    and, binary::BinaryTypeCoercer, lit, or, BinaryExpr, Case, ColumnarValue, Expr, Like,
-    Operator, Volatility,
+    BinaryExpr, Case, ColumnarValue, Expr, ExprSchemable, Like, Operator, Volatility,
+    and, binary::BinaryTypeCoercer, lit, or, preimage::PreimageResult,
 };
+use datafusion_expr::{Cast, TryCast, simplify::ExprSimplifyResult};
 use datafusion_expr::{expr::ScalarFunction, interval_arithmetic::NullableInterval};
 use datafusion_expr::{
     expr::{InList, InSubquery},
     utils::{iter_conjunction, iter_conjunction_owned},
 };
-use datafusion_expr::{simplify::ExprSimplifyResult, Cast, TryCast};
 use datafusion_physical_expr::{create_physical_expr, execution_props::ExecutionProps};
 
 use super::inlist_simplifier::ShortenInListSimplifier;
 use super::utils::*;
-use crate::analyzer::type_coercion::TypeCoercionRewriter;
-use crate::simplify_expressions::guarantees::GuaranteeRewriter;
+use crate::simplify_expressions::SimplifyContext;
 use crate::simplify_expressions::regex::simplify_regex_expr;
 use crate::simplify_expressions::unwrap_cast::{
     is_cast_expr_and_support_unwrap_cast_in_comparison_for_binary,
     is_cast_expr_and_support_unwrap_cast_in_comparison_for_inlist,
     unwrap_cast_in_comparison_for_binary,
 };
-use crate::simplify_expressions::SimplifyInfo;
-use datafusion_expr::expr::FieldMetadata;
+use crate::{
+    analyzer::type_coercion::TypeCoercionRewriter,
+    simplify_expressions::udf_preimage::rewrite_with_preimage,
+};
+use datafusion_expr::expr_rewriter::rewrite_with_guarantees_map;
 use datafusion_expr_common::casts::try_cast_literal_to_type;
 use indexmap::IndexSet;
 use regex::Regex;
@@ -67,23 +74,19 @@ use regex::Regex;
 ///
 /// For example:
 /// ```
-/// use arrow::datatypes::{Schema, Field, DataType};
-/// use datafusion_expr::{col, lit};
+/// use arrow::datatypes::{DataType, Field, Schema};
 /// use datafusion_common::{DataFusionError, ToDFSchema};
-/// use datafusion_expr::execution_props::ExecutionProps;
 /// use datafusion_expr::simplify::SimplifyContext;
+/// use datafusion_expr::{col, lit};
 /// use datafusion_optimizer::simplify_expressions::ExprSimplifier;
 ///
 /// // Create the schema
-/// let schema = Schema::new(vec![
-///     Field::new("i", DataType::Int64, false),
-///   ])
-///   .to_dfschema_ref().unwrap();
+/// let schema = Schema::new(vec![Field::new("i", DataType::Int64, false)])
+///     .to_dfschema_ref()
+///     .unwrap();
 ///
 /// // Create the simplifier
-/// let props = ExecutionProps::new();
-/// let context = SimplifyContext::new(&props)
-///    .with_schema(schema);
+/// let context = SimplifyContext::default().with_schema(schema);
 /// let simplifier = ExprSimplifier::new(context);
 ///
 /// // Use the simplifier
@@ -95,8 +98,8 @@ use regex::Regex;
 /// let simplified = simplifier.simplify(expr).unwrap();
 /// assert_eq!(simplified, col("b").lt(lit(2)));
 /// ```
-pub struct ExprSimplifier<S> {
-    info: S,
+pub struct ExprSimplifier {
+    info: SimplifyContext,
     /// Guarantees about the values of columns. This is provided by the user
     /// in [ExprSimplifier::with_guarantees()].
     guarantees: Vec<(Expr, NullableInterval)>,
@@ -110,13 +113,12 @@ pub struct ExprSimplifier<S> {
 pub const THRESHOLD_INLINE_INLIST: usize = 3;
 pub const DEFAULT_MAX_SIMPLIFIER_CYCLES: u32 = 3;
 
-impl<S: SimplifyInfo> ExprSimplifier<S> {
-    /// Create a new `ExprSimplifier` with the given `info` such as an
-    /// instance of [`SimplifyContext`]. See
-    /// [`simplify`](Self::simplify) for an example.
+impl ExprSimplifier {
+    /// Create a new `ExprSimplifier` with the given [`SimplifyContext`].
+    /// See [`simplify`](Self::simplify) for an example.
     ///
     /// [`SimplifyContext`]: datafusion_expr::simplify::SimplifyContext
-    pub fn new(info: S) -> Self {
+    pub fn new(info: SimplifyContext) -> Self {
         Self {
             info,
             guarantees: vec![],
@@ -141,40 +143,21 @@ impl<S: SimplifyInfo> ExprSimplifier<S> {
     /// `b > 2`
     ///
     /// ```
-    /// use arrow::datatypes::DataType;
-    /// use datafusion_expr::{col, lit, Expr};
+    /// use arrow::datatypes::{DataType, Field, Schema};
+    /// use datafusion_common::{DFSchema, ToDFSchema};
     /// use datafusion_common::Result;
-    /// use datafusion_expr::execution_props::ExecutionProps;
     /// use datafusion_expr::simplify::SimplifyContext;
-    /// use datafusion_expr::simplify::SimplifyInfo;
+    /// use datafusion_expr::{col, lit, Expr};
     /// use datafusion_optimizer::simplify_expressions::ExprSimplifier;
-    /// use datafusion_common::DFSchema;
     /// use std::sync::Arc;
     ///
-    /// /// Simple implementation that provides `Simplifier` the information it needs
-    /// /// See SimplifyContext for a structure that does this.
-    /// #[derive(Default)]
-    /// struct Info {
-    ///   execution_props: ExecutionProps,
-    /// };
-    ///
-    /// impl SimplifyInfo for Info {
-    ///   fn is_boolean_type(&self, expr: &Expr) -> Result<bool> {
-    ///     Ok(false)
-    ///   }
-    ///   fn nullable(&self, expr: &Expr) -> Result<bool> {
-    ///     Ok(true)
-    ///   }
-    ///   fn execution_props(&self) -> &ExecutionProps {
-    ///     &self.execution_props
-    ///   }
-    ///   fn get_data_type(&self, expr: &Expr) -> Result<DataType> {
-    ///     Ok(DataType::Int32)
-    ///   }
-    /// }
-    ///
+    /// // Create a schema and SimplifyContext
+    /// let schema = Schema::new(vec![Field::new("b", DataType::Int32, true)])
+    ///     .to_dfschema_ref()
+    ///     .unwrap();
     /// // Create the simplifier
-    /// let simplifier = ExprSimplifier::new(Info::default());
+    /// let context = SimplifyContext::default().with_schema(schema);
+    /// let simplifier = ExprSimplifier::new(context);
     ///
     /// // b < 2
     /// let b_lt_2 = col("b").gt(lit(2));
@@ -196,12 +179,11 @@ impl<S: SimplifyInfo> ExprSimplifier<S> {
     /// optimizations.
     ///
     /// See [Self::simplify] for details and usage examples.
-    ///
     #[deprecated(
         since = "48.0.0",
         note = "Use `simplify_with_cycle_count_transformed` instead"
     )]
-    #[allow(unused_mut)]
+    #[expect(unused_mut)]
     pub fn simplify_with_cycle_count(&self, mut expr: Expr) -> Result<(Expr, u32)> {
         let (transformed, cycle_count) =
             self.simplify_with_cycle_count_transformed(expr)?;
@@ -220,15 +202,16 @@ impl<S: SimplifyInfo> ExprSimplifier<S> {
     /// - The number of simplification cycles that were performed
     ///
     /// See [Self::simplify] for details and usage examples.
-    ///
     pub fn simplify_with_cycle_count_transformed(
         &self,
         mut expr: Expr,
     ) -> Result<(Transformed<Expr>, u32)> {
         let mut simplifier = Simplifier::new(&self.info);
-        let mut const_evaluator = ConstEvaluator::try_new(self.info.execution_props())?;
+        let config_options = Some(Arc::clone(self.info.config_options()));
+        let mut const_evaluator = ConstEvaluator::try_new(config_options)?;
         let mut shorten_in_list_simplifier = ShortenInListSimplifier::new();
-        let mut guarantee_rewriter = GuaranteeRewriter::new(&self.guarantees);
+        let guarantees_map: HashMap<&Expr, &NullableInterval> =
+            self.guarantees.iter().map(|(k, v)| (k, v)).collect();
 
         if self.canonicalize {
             expr = expr.rewrite(&mut Canonicalizer::new()).data()?
@@ -245,7 +228,9 @@ impl<S: SimplifyInfo> ExprSimplifier<S> {
             } = expr
                 .rewrite(&mut const_evaluator)?
                 .transform_data(|expr| expr.rewrite(&mut simplifier))?
-                .transform_data(|expr| expr.rewrite(&mut guarantee_rewriter))?;
+                .transform_data(|expr| {
+                    rewrite_with_guarantees_map(expr, &guarantees_map)
+                })?;
             expr = data;
             num_cycles += 1;
             // Track if any transformation occurred
@@ -284,24 +269,22 @@ impl<S: SimplifyInfo> ExprSimplifier<S> {
     ///
     /// ```rust
     /// use arrow::datatypes::{DataType, Field, Schema};
-    /// use datafusion_expr::{col, lit, Expr};
-    /// use datafusion_expr::interval_arithmetic::{Interval, NullableInterval};
     /// use datafusion_common::{Result, ScalarValue, ToDFSchema};
-    /// use datafusion_expr::execution_props::ExecutionProps;
+    /// use datafusion_expr::interval_arithmetic::{Interval, NullableInterval};
     /// use datafusion_expr::simplify::SimplifyContext;
+    /// use datafusion_expr::{col, lit, Expr};
     /// use datafusion_optimizer::simplify_expressions::ExprSimplifier;
     ///
     /// let schema = Schema::new(vec![
-    ///   Field::new("x", DataType::Int64, false),
-    ///   Field::new("y", DataType::UInt32, false),
-    ///   Field::new("z", DataType::Int64, false),
-    ///   ])
-    ///   .to_dfschema_ref().unwrap();
+    ///     Field::new("x", DataType::Int64, false),
+    ///     Field::new("y", DataType::UInt32, false),
+    ///     Field::new("z", DataType::Int64, false),
+    /// ])
+    /// .to_dfschema_ref()
+    /// .unwrap();
     ///
     /// // Create the simplifier
-    /// let props = ExecutionProps::new();
-    /// let context = SimplifyContext::new(&props)
-    ///    .with_schema(schema);
+    /// let context = SimplifyContext::default().with_schema(schema);
     ///
     /// // Expression: (x >= 3) AND (y + 2 < 10) AND (z > 5)
     /// let expr_x = col("x").gt_eq(lit(3_i64));
@@ -310,15 +293,18 @@ impl<S: SimplifyInfo> ExprSimplifier<S> {
     /// let expr = expr_x.and(expr_y).and(expr_z.clone());
     ///
     /// let guarantees = vec![
-    ///    // x ∈ [3, 5]
-    ///    (
-    ///        col("x"),
-    ///        NullableInterval::NotNull {
-    ///            values: Interval::make(Some(3_i64), Some(5_i64)).unwrap()
-    ///        }
-    ///    ),
-    ///    // y = 3
-    ///    (col("y"), NullableInterval::from(ScalarValue::UInt32(Some(3)))),
+    ///     // x ∈ [3, 5]
+    ///     (
+    ///         col("x"),
+    ///         NullableInterval::NotNull {
+    ///             values: Interval::make(Some(3_i64), Some(5_i64)).unwrap(),
+    ///         },
+    ///     ),
+    ///     // y = 3
+    ///     (
+    ///         col("y"),
+    ///         NullableInterval::from(ScalarValue::UInt32(Some(3))),
+    ///     ),
     /// ];
     /// let simplifier = ExprSimplifier::new(context).with_guarantees(guarantees);
     /// let output = simplifier.simplify(expr).unwrap();
@@ -343,24 +329,22 @@ impl<S: SimplifyInfo> ExprSimplifier<S> {
     ///
     /// ```rust
     /// use arrow::datatypes::{DataType, Field, Schema};
-    /// use datafusion_expr::{col, lit, Expr};
-    /// use datafusion_expr::interval_arithmetic::{Interval, NullableInterval};
     /// use datafusion_common::{Result, ScalarValue, ToDFSchema};
-    /// use datafusion_expr::execution_props::ExecutionProps;
+    /// use datafusion_expr::interval_arithmetic::{Interval, NullableInterval};
     /// use datafusion_expr::simplify::SimplifyContext;
+    /// use datafusion_expr::{col, lit, Expr};
     /// use datafusion_optimizer::simplify_expressions::ExprSimplifier;
     ///
     /// let schema = Schema::new(vec![
-    ///   Field::new("a", DataType::Int64, false),
-    ///   Field::new("b", DataType::Int64, false),
-    ///   Field::new("c", DataType::Int64, false),
-    ///   ])
-    ///   .to_dfschema_ref().unwrap();
+    ///     Field::new("a", DataType::Int64, false),
+    ///     Field::new("b", DataType::Int64, false),
+    ///     Field::new("c", DataType::Int64, false),
+    /// ])
+    /// .to_dfschema_ref()
+    /// .unwrap();
     ///
     /// // Create the simplifier
-    /// let props = ExecutionProps::new();
-    /// let context = SimplifyContext::new(&props)
-    ///    .with_schema(schema);
+    /// let context = SimplifyContext::default().with_schema(schema);
     /// let simplifier = ExprSimplifier::new(context);
     ///
     /// // Expression: a = c AND 1 = b
@@ -374,9 +358,9 @@ impl<S: SimplifyInfo> ExprSimplifier<S> {
     ///
     /// // If canonicalization is disabled, the expression is not changed
     /// let non_canonicalized = simplifier
-    ///   .with_canonicalize(false)
-    ///   .simplify(expr.clone())
-    ///   .unwrap();
+    ///     .with_canonicalize(false)
+    ///     .simplify(expr.clone())
+    ///     .unwrap();
     ///
     /// assert_eq!(non_canonicalized, expr);
     /// ```
@@ -405,7 +389,6 @@ impl<S: SimplifyInfo> ExprSimplifier<S> {
     /// use arrow::datatypes::{DataType, Field, Schema};
     /// use datafusion_expr::{col, lit, Expr};
     /// use datafusion_common::{Result, ScalarValue, ToDFSchema};
-    /// use datafusion_expr::execution_props::ExecutionProps;
     /// use datafusion_expr::simplify::SimplifyContext;
     /// use datafusion_optimizer::simplify_expressions::ExprSimplifier;
     ///
@@ -415,9 +398,7 @@ impl<S: SimplifyInfo> ExprSimplifier<S> {
     ///   .to_dfschema_ref().unwrap();
     ///
     /// // Create the simplifier
-    /// let props = ExecutionProps::new();
-    /// let context = SimplifyContext::new(&props)
-    ///    .with_schema(schema);
+    /// let context = SimplifyContext::default().with_schema(schema);
     /// let simplifier = ExprSimplifier::new(context);
     ///
     /// // Expression: a IS NOT NULL
@@ -435,7 +416,6 @@ impl<S: SimplifyInfo> ExprSimplifier<S> {
     /// assert_eq!(simplified_expr.data, lit(true));
     /// // Only 1 cycle was executed
     /// assert_eq!(count, 1);
-    ///
     /// ```
     pub fn with_max_cycles(mut self, max_simplifier_cycles: u32) -> Self {
         self.max_simplifier_cycles = max_simplifier_cycles;
@@ -492,12 +472,11 @@ impl TreeNodeRewriter for Canonicalizer {
     }
 }
 
-#[allow(rustdoc::private_intra_doc_links)]
 /// Partially evaluate `Expr`s so constant subtrees are evaluated at plan time.
 ///
 /// Note it does not handle algebraic rewrites such as `(a or false)`
 /// --> `a`, which is handled by [`Simplifier`]
-struct ConstEvaluator<'a> {
+struct ConstEvaluator {
     /// `can_evaluate` is used during the depth-first-search of the
     /// `Expr` tree to track if any siblings (or their descendants) were
     /// non evaluatable (e.g. had a column reference or volatile
@@ -511,13 +490,17 @@ struct ConstEvaluator<'a> {
     /// means there were no non evaluatable siblings (or their
     /// descendants) so this `Expr` can be evaluated
     can_evaluate: Vec<bool>,
-
-    execution_props: &'a ExecutionProps,
+    /// Execution properties needed to call [`create_physical_expr`].
+    /// `ConstEvaluator` only evaluates expressions without column references
+    /// (i.e. constant expressions) and doesn't use the variable binding features
+    /// of `ExecutionProps` (we explicitly filter out [`Expr::ScalarVariable`]).
+    /// The `config_options` are passed from the session to allow scalar functions
+    /// to access configuration like timezone.
+    execution_props: ExecutionProps,
     input_schema: DFSchema,
     input_batch: RecordBatch,
 }
 
-#[allow(dead_code)]
 /// The simplify result of ConstEvaluator
 enum ConstSimplifyResult {
     // Expr was simplified and contains the new expression
@@ -528,7 +511,7 @@ enum ConstSimplifyResult {
     SimplifyRuntimeError(DataFusionError, Expr),
 }
 
-impl TreeNodeRewriter for ConstEvaluator<'_> {
+impl TreeNodeRewriter for ConstEvaluator {
     type Node = Expr;
 
     fn f_down(&mut self, expr: Expr) -> Result<Transformed<Expr>> {
@@ -571,7 +554,17 @@ impl TreeNodeRewriter for ConstEvaluator<'_> {
                 ConstSimplifyResult::NotSimplified(s, m) => {
                     Ok(Transformed::no(Expr::Literal(s, m)))
                 }
-                ConstSimplifyResult::SimplifyRuntimeError(_, expr) => {
+                ConstSimplifyResult::SimplifyRuntimeError(err, expr) => {
+                    // For CAST expressions with literal inputs, propagate the error at plan time rather than deferring to execution time.
+                    // This provides clearer error messages and fails fast.
+                    if let Expr::Cast(Cast { ref expr, .. })
+                    | Expr::TryCast(TryCast { ref expr, .. }) = expr
+                        && matches!(expr.as_ref(), Expr::Literal(_, _))
+                    {
+                        return Err(err);
+                    }
+                    // For other expressions (like CASE, COALESCE), preserve the original
+                    // to allow short-circuit evaluation at execution time
                     Ok(Transformed::yes(expr))
                 }
             },
@@ -581,19 +574,32 @@ impl TreeNodeRewriter for ConstEvaluator<'_> {
     }
 }
 
-impl<'a> ConstEvaluator<'a> {
-    /// Create a new `ConstantEvaluator`. Session constants (such as
-    /// the time for `now()` are taken from the passed
-    /// `execution_props`.
-    pub fn try_new(execution_props: &'a ExecutionProps) -> Result<Self> {
+impl ConstEvaluator {
+    /// Create a new `ConstantEvaluator`.
+    ///
+    /// Note: `ConstEvaluator` filters out expressions with scalar variables
+    /// (like `$var`) and volatile functions, so it creates its own default
+    /// `ExecutionProps` internally. The filtered expressions will be evaluated
+    /// at runtime where proper variable bindings are available.
+    ///
+    /// The `config_options` parameter is used to pass session configuration
+    /// (like timezone) to scalar functions during constant evaluation.
+    pub fn try_new(config_options: Option<Arc<ConfigOptions>>) -> Result<Self> {
         // The dummy column name is unused and doesn't matter as only
         // expressions without column references can be evaluated
         static DUMMY_COL_NAME: &str = ".";
-        let schema = Schema::new(vec![Field::new(DUMMY_COL_NAME, DataType::Null, true)]);
-        let input_schema = DFSchema::try_from(schema.clone())?;
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            DUMMY_COL_NAME,
+            DataType::Null,
+            true,
+        )]));
+        let input_schema = DFSchema::try_from(Arc::clone(&schema))?;
         // Need a single "input" row to produce a single output row
         let col = new_null_array(&DataType::Null, 1);
-        let input_batch = RecordBatch::try_new(std::sync::Arc::new(schema), vec![col])?;
+        let input_batch = RecordBatch::try_new(schema, vec![col])?;
+
+        let mut execution_props = ExecutionProps::new();
+        execution_props.config_options = config_options;
 
         Ok(Self {
             can_evaluate: vec![],
@@ -630,6 +636,7 @@ impl<'a> ConstEvaluator<'a> {
             | Expr::OuterReferenceColumn(_, _)
             | Expr::Exists { .. }
             | Expr::InSubquery(_)
+            | Expr::SetComparison(_)
             | Expr::ScalarSubquery(_)
             | Expr::WindowFunction { .. }
             | Expr::GroupingSet(_)
@@ -637,6 +644,30 @@ impl<'a> ConstEvaluator<'a> {
             | Expr::Placeholder(_) => false,
             Expr::ScalarFunction(ScalarFunction { func, .. }) => {
                 Self::volatility_ok(func.signature().volatility)
+            }
+            Expr::Cast(Cast { expr, data_type })
+            | Expr::TryCast(TryCast { expr, data_type }) => {
+                if let (
+                    Ok(DataType::Struct(source_fields)),
+                    DataType::Struct(target_fields),
+                ) = (expr.get_type(&DFSchema::empty()), data_type)
+                {
+                    // Don't const-fold struct casts with different field counts
+                    if source_fields.len() != target_fields.len() {
+                        return false;
+                    }
+
+                    // Don't const-fold struct casts with empty (0-row) literals
+                    // The simplifier uses a 1-row input batch, which causes dimension mismatches
+                    // when evaluating 0-row struct literals
+                    if let Expr::Literal(ScalarValue::Struct(struct_array), _) =
+                        expr.as_ref()
+                        && struct_array.len() == 0
+                    {
+                        return false;
+                    }
+                }
+                true
             }
             Expr::Literal(_, _)
             | Expr::Alias(..)
@@ -656,8 +687,6 @@ impl<'a> ConstEvaluator<'a> {
             | Expr::Like { .. }
             | Expr::SimilarTo { .. }
             | Expr::Case(_)
-            | Expr::Cast { .. }
-            | Expr::TryCast { .. }
             | Expr::InList { .. } => true,
         }
     }
@@ -668,11 +697,14 @@ impl<'a> ConstEvaluator<'a> {
             return ConstSimplifyResult::NotSimplified(s, m);
         }
 
-        let phys_expr =
-            match create_physical_expr(&expr, &self.input_schema, self.execution_props) {
-                Ok(e) => e,
-                Err(err) => return ConstSimplifyResult::SimplifyRuntimeError(err, expr),
-            };
+        let phys_expr = match create_physical_expr(
+            &expr,
+            &self.input_schema,
+            &self.execution_props,
+        ) {
+            Ok(e) => e,
+            Err(err) => return ConstSimplifyResult::SimplifyRuntimeError(err, expr),
+        };
         let metadata = phys_expr
             .return_field(self.input_batch.schema_ref())
             .ok()
@@ -691,7 +723,10 @@ impl<'a> ConstEvaluator<'a> {
             ColumnarValue::Array(a) => {
                 if a.len() != 1 {
                     ConstSimplifyResult::SimplifyRuntimeError(
-                        DataFusionError::Execution(format!("Could not evaluate the expression, found a result of length {}", a.len())),
+                        exec_datafusion_err!(
+                            "Could not evaluate the expression, found a result of length {}",
+                            a.len()
+                        ),
                         expr,
                     )
                 } else if as_list_array(&a).is_ok() {
@@ -707,35 +742,12 @@ impl<'a> ConstEvaluator<'a> {
                 } else {
                     // Non-ListArray
                     match ScalarValue::try_from_array(&a, 0) {
-                        Ok(s) => {
-                            // TODO: support the optimization for `Map` type after support impl hash for it
-                            if matches!(&s, ScalarValue::Map(_)) {
-                                ConstSimplifyResult::SimplifyRuntimeError(
-                                    DataFusionError::NotImplemented("Const evaluate for Map type is still not supported".to_string()),
-                                    expr,
-                                )
-                            } else {
-                                ConstSimplifyResult::Simplified(s, metadata)
-                            }
-                        }
+                        Ok(s) => ConstSimplifyResult::Simplified(s, metadata),
                         Err(err) => ConstSimplifyResult::SimplifyRuntimeError(err, expr),
                     }
                 }
             }
-            ColumnarValue::Scalar(s) => {
-                // TODO: support the optimization for `Map` type after support impl hash for it
-                if matches!(&s, ScalarValue::Map(_)) {
-                    ConstSimplifyResult::SimplifyRuntimeError(
-                        DataFusionError::NotImplemented(
-                            "Const evaluate for Map type is still not supported"
-                                .to_string(),
-                        ),
-                        expr,
-                    )
-                } else {
-                    ConstSimplifyResult::Simplified(s, metadata)
-                }
-            }
+            ColumnarValue::Scalar(s) => ConstSimplifyResult::Simplified(s, metadata),
         }
     }
 }
@@ -749,17 +761,17 @@ impl<'a> ConstEvaluator<'a> {
 /// * `false = true` and `true = false` to `false`
 /// * `!!expr` to `expr`
 /// * `expr = null` and `expr != null` to `null`
-struct Simplifier<'a, S> {
-    info: &'a S,
+struct Simplifier<'a> {
+    info: &'a SimplifyContext,
 }
 
-impl<'a, S> Simplifier<'a, S> {
-    pub fn new(info: &'a S) -> Self {
+impl<'a> Simplifier<'a> {
+    pub fn new(info: &'a SimplifyContext) -> Self {
         Self { info }
     }
 }
 
-impl<S: SimplifyInfo> TreeNodeRewriter for Simplifier<'_, S> {
+impl TreeNodeRewriter for Simplifier<'_> {
     type Node = Expr;
 
     /// rewrite the expression simplifying any constant expressions
@@ -1054,8 +1066,26 @@ impl<S: SimplifyInfo> TreeNodeRewriter for Simplifier<'_, S> {
                         right: left_right,
                     }))
                 } else {
-                    return internal_err!("can_reduce_to_equal_statement should only be called with a BinaryExpr");
+                    return internal_err!(
+                        "can_reduce_to_equal_statement should only be called with a BinaryExpr"
+                    );
                 }
+            }
+            // A = L1 AND A != L2 --> A = L1 (when L1 != L2)
+            Expr::BinaryExpr(BinaryExpr {
+                left,
+                op: And,
+                right,
+            }) if is_eq_and_ne_with_different_literal(&left, &right) => {
+                Transformed::yes(*left)
+            }
+            // A != L2 AND A = L1 --> A = L1 (when L1 != L2)
+            Expr::BinaryExpr(BinaryExpr {
+                left,
+                op: And,
+                right,
+            }) if is_eq_and_ne_with_different_literal(&right, &left) => {
+                Transformed::yes(*right)
             }
 
             //
@@ -1395,6 +1425,89 @@ impl<S: SimplifyInfo> TreeNodeRewriter for Simplifier<'_, S> {
             // Rules for Case
             //
 
+            // Inline a comparison to a literal with the case statement into the `THEN` clauses.
+            // which can enable further simplifications
+            // CASE WHEN X THEN "a" WHEN Y THEN "b" ... END = "a" --> CASE WHEN X THEN "a" = "a" WHEN Y THEN "b" = "a" END
+            Expr::BinaryExpr(BinaryExpr {
+                left,
+                op: op @ (Eq | NotEq),
+                right,
+            }) if is_case_with_literal_outputs(&left) && is_lit(&right) => {
+                let case = into_case(*left)?;
+                Transformed::yes(Expr::Case(Case {
+                    expr: None,
+                    when_then_expr: case
+                        .when_then_expr
+                        .into_iter()
+                        .map(|(when, then)| {
+                            (
+                                when,
+                                Box::new(Expr::BinaryExpr(BinaryExpr {
+                                    left: then,
+                                    op,
+                                    right: right.clone(),
+                                })),
+                            )
+                        })
+                        .collect(),
+                    else_expr: case.else_expr.map(|els| {
+                        Box::new(Expr::BinaryExpr(BinaryExpr {
+                            left: els,
+                            op,
+                            right,
+                        }))
+                    }),
+                }))
+            }
+
+            // CASE WHEN true THEN A ... END --> A
+            // CASE WHEN X THEN A WHEN TRUE THEN B ... END --> CASE WHEN X THEN A ELSE B END
+            // CASE WHEN false THEN A END --> NULL
+            // CASE WHEN false THEN A ELSE B END --> B
+            // CASE WHEN X THEN A WHEN false THEN B END --> CASE WHEN X THEN A ELSE B END
+            Expr::Case(Case {
+                expr: None,
+                when_then_expr,
+                mut else_expr,
+            }) if when_then_expr
+                .iter()
+                .any(|(when, _)| is_true(when.as_ref()) || is_false(when.as_ref())) =>
+            {
+                let out_type = info.get_data_type(&when_then_expr[0].1)?;
+                let mut new_when_then_expr = Vec::with_capacity(when_then_expr.len());
+
+                for (when, then) in when_then_expr.into_iter() {
+                    if is_true(when.as_ref()) {
+                        // Skip adding the rest of the when-then expressions after WHEN true
+                        // CASE WHEN X THEN A WHEN TRUE THEN B ... END --> CASE WHEN X THEN A ELSE B END
+                        else_expr = Some(then);
+                        break;
+                    } else if !is_false(when.as_ref()) {
+                        new_when_then_expr.push((when, then));
+                    }
+                    // else: skip WHEN false cases
+                }
+
+                // Exclude CASE statement altogether if there are no when-then expressions left
+                if new_when_then_expr.is_empty() {
+                    // CASE WHEN false THEN A ELSE B END --> B
+                    if let Some(else_expr) = else_expr {
+                        return Ok(Transformed::yes(*else_expr));
+                    // CASE WHEN false THEN A END --> NULL
+                    } else {
+                        let null =
+                            Expr::Literal(ScalarValue::try_new_null(&out_type)?, None);
+                        return Ok(Transformed::yes(null));
+                    }
+                }
+
+                Transformed::yes(Expr::Case(Case {
+                    expr: None,
+                    when_then_expr: new_when_then_expr,
+                    else_expr,
+                }))
+            }
+
             // CASE
             //   WHEN X THEN A
             //   WHEN Y THEN B
@@ -1411,7 +1524,11 @@ impl<S: SimplifyInfo> TreeNodeRewriter for Simplifier<'_, S> {
                 when_then_expr,
                 else_expr,
             }) if !when_then_expr.is_empty()
-                && when_then_expr.len() < 3 // The rewrite is O(n²) so limit to small number
+                // The rewrite is O(n²) in general so limit to small number of when-thens that can be true
+                && (when_then_expr.len() < 3 // small number of input whens
+                    // or all thens are literal bools and a small number of them are true
+                    || (when_then_expr.iter().all(|(_, then)| is_bool_lit(then))
+                        && when_then_expr.iter().filter(|(_, then)| is_true(then)).count() < 3))
                 && info.is_boolean_type(&when_then_expr[0].1)? =>
             {
                 // String disjunction of all the when predicates encountered so far. Not nullable.
@@ -1434,6 +1551,55 @@ impl<S: SimplifyInfo> TreeNodeRewriter for Simplifier<'_, S> {
 
                 // Do a first pass at simplification
                 out_expr.rewrite(self)?
+            }
+            // CASE
+            //   WHEN X THEN true
+            //   WHEN Y THEN true
+            //   WHEN Z THEN false
+            //   ...
+            //   ELSE true
+            // END
+            //
+            // --->
+            //
+            // NOT(CASE
+            //   WHEN X THEN false
+            //   WHEN Y THEN false
+            //   WHEN Z THEN true
+            //   ...
+            //   ELSE false
+            // END)
+            //
+            // Note: the rationale for this rewrite is that the case can then be further
+            // simplified into a small number of ANDs and ORs
+            Expr::Case(Case {
+                expr: None,
+                when_then_expr,
+                else_expr,
+            }) if !when_then_expr.is_empty()
+                && when_then_expr
+                    .iter()
+                    .all(|(_, then)| is_bool_lit(then)) // all thens are literal bools
+                // This simplification is only helpful if we end up with a small number of true thens
+                && when_then_expr
+                    .iter()
+                    .filter(|(_, then)| is_false(then))
+                    .count()
+                    < 3
+                && else_expr.as_deref().is_none_or(is_bool_lit) =>
+            {
+                Transformed::yes(
+                    Expr::Case(Case {
+                        expr: None,
+                        when_then_expr: when_then_expr
+                            .into_iter()
+                            .map(|(when, then)| (when, Box::new(Expr::Not(then))))
+                            .collect(),
+                        else_expr: else_expr
+                            .map(|else_expr| Box::new(Expr::Not(else_expr))),
+                    })
+                    .not(),
+                )
             }
             Expr::ScalarFunction(ScalarFunction { func: udf, args }) => {
                 match udf.simplify(args, info)? {
@@ -1531,7 +1697,7 @@ impl<S: SimplifyInfo> TreeNodeRewriter for Simplifier<'_, S> {
                                     .to_string();
                                 Transformed::yes(Expr::Like(Like {
                                     pattern: Box::new(to_string_scalar(
-                                        data_type,
+                                        &data_type,
                                         Some(simplified_pattern),
                                     )),
                                     ..like
@@ -1807,7 +1973,7 @@ impl<S: SimplifyInfo> TreeNodeRewriter for Simplifier<'_, S> {
                                 // we need to unwrap the cast for cast/try_cast expr, and add cast to the literal
                                 let Some(value) = try_cast_literal_to_type(&right_lit_value, &expr_type) else {
                                     internal_err!(
-                                        "Can't cast the list expr {:?} to type {:?}",
+                                        "Can't cast the list expr {:?} to type {}",
                                         right_lit_value, &expr_type
                                     )?
                                 };
@@ -1828,9 +1994,82 @@ impl<S: SimplifyInfo> TreeNodeRewriter for Simplifier<'_, S> {
                 }))
             }
 
+            // =======================================
+            // preimage_in_comparison
+            // =======================================
+            //
+            // For case:
+            // date_part('YEAR', expr) op literal
+            //
+            // For details see datafusion_expr::ScalarUDFImpl::preimage
+            Expr::BinaryExpr(BinaryExpr { left, op, right }) => {
+                use datafusion_expr::Operator::*;
+                let is_preimage_op = matches!(
+                    op,
+                    Eq | NotEq
+                        | Lt
+                        | LtEq
+                        | Gt
+                        | GtEq
+                        | IsDistinctFrom
+                        | IsNotDistinctFrom
+                );
+                if !is_preimage_op || is_null(&right) {
+                    return Ok(Transformed::no(Expr::BinaryExpr(BinaryExpr {
+                        left,
+                        op,
+                        right,
+                    })));
+                }
+
+                if let PreimageResult::Range { interval, expr } =
+                    get_preimage(left.as_ref(), right.as_ref(), info)?
+                {
+                    rewrite_with_preimage(*interval, op, expr)?
+                } else if let Some(swapped) = op.swap() {
+                    if let PreimageResult::Range { interval, expr } =
+                        get_preimage(right.as_ref(), left.as_ref(), info)?
+                    {
+                        rewrite_with_preimage(*interval, swapped, expr)?
+                    } else {
+                        Transformed::no(Expr::BinaryExpr(BinaryExpr { left, op, right }))
+                    }
+                } else {
+                    Transformed::no(Expr::BinaryExpr(BinaryExpr { left, op, right }))
+                }
+            }
+
             // no additional rewrites possible
             expr => Transformed::no(expr),
         })
+    }
+}
+
+fn get_preimage(
+    left_expr: &Expr,
+    right_expr: &Expr,
+    info: &SimplifyContext,
+) -> Result<PreimageResult> {
+    let Expr::ScalarFunction(ScalarFunction { func, args }) = left_expr else {
+        return Ok(PreimageResult::None);
+    };
+    if !is_literal_or_literal_cast(right_expr) {
+        return Ok(PreimageResult::None);
+    }
+    if func.signature().volatility != Volatility::Immutable {
+        return Ok(PreimageResult::None);
+    }
+    func.preimage(args, right_expr, info)
+}
+
+fn is_literal_or_literal_cast(expr: &Expr) -> bool {
+    match expr {
+        Expr::Literal(_, _) => true,
+        Expr::Cast(Cast { expr, .. }) => matches!(expr.as_ref(), Expr::Literal(_, _)),
+        Expr::TryCast(TryCast { expr, .. }) => {
+            matches!(expr.as_ref(), Expr::Literal(_, _))
+        }
+        _ => false,
     }
 }
 
@@ -1843,7 +2082,7 @@ fn as_string_scalar(expr: &Expr) -> Option<(DataType, &Option<String>)> {
     }
 }
 
-fn to_string_scalar(data_type: DataType, value: Option<String>) -> Expr {
+fn to_string_scalar(data_type: &DataType, value: Option<String>) -> Expr {
     match data_type {
         DataType::Utf8 => Expr::Literal(ScalarValue::Utf8(value), None),
         DataType::LargeUtf8 => Expr::Literal(ScalarValue::LargeUtf8(value), None),
@@ -1888,7 +2127,7 @@ fn are_inlist_and_eq(left: &Expr, right: &Expr) -> bool {
 }
 
 /// Try to convert an expression to an in-list expression
-fn as_inlist(expr: &Expr) -> Option<Cow<InList>> {
+fn as_inlist(expr: &'_ Expr) -> Option<Cow<'_, InList>> {
     match expr {
         Expr::InList(inlist) => Some(Cow::Borrowed(inlist)),
         Expr::BinaryExpr(BinaryExpr { left, op, right }) if *op == Operator::Eq => {
@@ -1983,7 +2222,7 @@ fn inlist_except(mut l1: InList, l2: &InList) -> Result<Expr> {
 }
 
 /// Returns expression testing a boolean `expr` for being exactly `true` (not `false` or NULL).
-fn is_exactly_true(expr: Expr, info: &impl SimplifyInfo) -> Result<Expr> {
+fn is_exactly_true(expr: Expr, info: &SimplifyContext) -> Result<Expr> {
     if !info.nullable(&expr)? {
         Ok(expr)
     } else {
@@ -1999,8 +2238,8 @@ fn is_exactly_true(expr: Expr, info: &impl SimplifyInfo) -> Result<Expr> {
 // A / 1 -> A
 //
 // Move this function body out of the large match branch avoid stack overflow
-fn simplify_right_is_one_case<S: SimplifyInfo>(
-    info: &S,
+fn simplify_right_is_one_case(
+    info: &SimplifyContext,
     left: Box<Expr>,
     op: &Operator,
     right: &Expr,
@@ -2026,8 +2265,11 @@ mod tests {
     use super::*;
     use crate::simplify_expressions::SimplifyContext;
     use crate::test::test_table_scan_with_name;
-    use arrow::datatypes::FieldRef;
-    use datafusion_common::{assert_contains, DFSchemaRef, ToDFSchema};
+    use arrow::{
+        array::{Int32Array, StructArray},
+        datatypes::{FieldRef, Fields},
+    };
+    use datafusion_common::{DFSchemaRef, ToDFSchema, assert_contains};
     use datafusion_expr::{
         expr::WindowFunction,
         function::{
@@ -2039,7 +2281,9 @@ mod tests {
     };
     use datafusion_functions_window_common::field::WindowUDFFieldArgs;
     use datafusion_functions_window_common::partition::PartitionEvaluatorArgs;
+    use datafusion_physical_expr::PhysicalExpr;
     use std::hash::Hash;
+    use std::sync::LazyLock;
     use std::{
         collections::HashMap,
         ops::{BitAnd, BitOr, BitXor},
@@ -2051,9 +2295,8 @@ mod tests {
     // ------------------------------
     #[test]
     fn api_basic() {
-        let props = ExecutionProps::new();
         let simplifier =
-            ExprSimplifier::new(SimplifyContext::new(&props).with_schema(test_schema()));
+            ExprSimplifier::new(SimplifyContext::default().with_schema(test_schema()));
 
         let expr = lit(1) + lit(2);
         let expected = lit(3);
@@ -2063,9 +2306,8 @@ mod tests {
     #[test]
     fn basic_coercion() {
         let schema = test_schema();
-        let props = ExecutionProps::new();
         let simplifier = ExprSimplifier::new(
-            SimplifyContext::new(&props).with_schema(Arc::clone(&schema)),
+            SimplifyContext::default().with_schema(Arc::clone(&schema)),
         );
 
         // Note expr type is int32 (not int64)
@@ -2080,19 +2322,21 @@ mod tests {
     }
 
     fn test_schema() -> DFSchemaRef {
-        Schema::new(vec![
-            Field::new("i", DataType::Int64, false),
-            Field::new("b", DataType::Boolean, true),
-        ])
-        .to_dfschema_ref()
-        .unwrap()
+        static TEST_SCHEMA: LazyLock<DFSchemaRef> = LazyLock::new(|| {
+            Schema::new(vec![
+                Field::new("i", DataType::Int64, false),
+                Field::new("b", DataType::Boolean, true),
+            ])
+            .to_dfschema_ref()
+            .unwrap()
+        });
+        Arc::clone(&TEST_SCHEMA)
     }
 
     #[test]
     fn simplify_and_constant_prop() {
-        let props = ExecutionProps::new();
         let simplifier =
-            ExprSimplifier::new(SimplifyContext::new(&props).with_schema(test_schema()));
+            ExprSimplifier::new(SimplifyContext::default().with_schema(test_schema()));
 
         // should be able to simplify to false
         // (i * (1 - 2)) > 0
@@ -2103,9 +2347,8 @@ mod tests {
 
     #[test]
     fn simplify_and_constant_prop_with_case() {
-        let props = ExecutionProps::new();
         let simplifier =
-            ExprSimplifier::new(SimplifyContext::new(&props).with_schema(test_schema()));
+            ExprSimplifier::new(SimplifyContext::default().with_schema(test_schema()));
 
         //   CASE
         //     WHEN i>5 AND false THEN i > 5
@@ -2271,6 +2514,27 @@ mod tests {
 
         assert_eq!(simplify(expr_a), expected);
         assert_eq!(simplify(expr_b), expected);
+    }
+
+    #[test]
+    fn test_simplify_eq_and_neq_with_different_literals() {
+        // A = 1 AND A != 0 --> A = 1 (when 1 != 0)
+        let expr = col("c2").eq(lit(1)).and(col("c2").not_eq(lit(0)));
+        let expected = col("c2").eq(lit(1));
+        assert_eq!(simplify(expr), expected);
+
+        // A != 0 AND A = 1 --> A = 1 (when 1 != 0)
+        let expr = col("c2").not_eq(lit(0)).and(col("c2").eq(lit(1)));
+        let expected = col("c2").eq(lit(1));
+        assert_eq!(simplify(expr), expected);
+
+        // Should NOT simplify when literals are the same (A = 1 AND A != 1)
+        // This is a contradiction but handled by other rules
+        let expr = col("c2").eq(lit(1)).and(col("c2").not_eq(lit(1)));
+        // Should not be simplified by this rule (left unchanged or handled elsewhere)
+        let result = simplify(expr.clone());
+        // The expression should not have been simplified
+        assert_eq!(result, expr);
     }
 
     #[test]
@@ -3219,18 +3483,15 @@ mod tests {
 
     fn try_simplify(expr: Expr) -> Result<Expr> {
         let schema = expr_test_schema();
-        let execution_props = ExecutionProps::new();
-        let simplifier = ExprSimplifier::new(
-            SimplifyContext::new(&execution_props).with_schema(schema),
-        );
+        let simplifier =
+            ExprSimplifier::new(SimplifyContext::default().with_schema(schema));
         simplifier.simplify(expr)
     }
 
     fn coerce(expr: Expr) -> Expr {
         let schema = expr_test_schema();
-        let execution_props = ExecutionProps::new();
         let simplifier = ExprSimplifier::new(
-            SimplifyContext::new(&execution_props).with_schema(Arc::clone(&schema)),
+            SimplifyContext::default().with_schema(Arc::clone(&schema)),
         );
         simplifier.coerce(expr, schema.as_ref()).unwrap()
     }
@@ -3241,10 +3502,8 @@ mod tests {
 
     fn try_simplify_with_cycle_count(expr: Expr) -> Result<(Expr, u32)> {
         let schema = expr_test_schema();
-        let execution_props = ExecutionProps::new();
-        let simplifier = ExprSimplifier::new(
-            SimplifyContext::new(&execution_props).with_schema(schema),
-        );
+        let simplifier =
+            ExprSimplifier::new(SimplifyContext::default().with_schema(schema));
         let (expr, count) = simplifier.simplify_with_cycle_count_transformed(expr)?;
         Ok((expr.data, count))
     }
@@ -3258,33 +3517,34 @@ mod tests {
         guarantees: Vec<(Expr, NullableInterval)>,
     ) -> Expr {
         let schema = expr_test_schema();
-        let execution_props = ExecutionProps::new();
-        let simplifier = ExprSimplifier::new(
-            SimplifyContext::new(&execution_props).with_schema(schema),
-        )
-        .with_guarantees(guarantees);
+        let simplifier =
+            ExprSimplifier::new(SimplifyContext::default().with_schema(schema))
+                .with_guarantees(guarantees);
         simplifier.simplify(expr).unwrap()
     }
 
     fn expr_test_schema() -> DFSchemaRef {
-        Arc::new(
-            DFSchema::from_unqualified_fields(
-                vec![
-                    Field::new("c1", DataType::Utf8, true),
-                    Field::new("c2", DataType::Boolean, true),
-                    Field::new("c3", DataType::Int64, true),
-                    Field::new("c4", DataType::UInt32, true),
-                    Field::new("c1_non_null", DataType::Utf8, false),
-                    Field::new("c2_non_null", DataType::Boolean, false),
-                    Field::new("c3_non_null", DataType::Int64, false),
-                    Field::new("c4_non_null", DataType::UInt32, false),
-                    Field::new("c5", DataType::FixedSizeBinary(3), true),
-                ]
-                .into(),
-                HashMap::new(),
+        static EXPR_TEST_SCHEMA: LazyLock<DFSchemaRef> = LazyLock::new(|| {
+            Arc::new(
+                DFSchema::from_unqualified_fields(
+                    vec![
+                        Field::new("c1", DataType::Utf8, true),
+                        Field::new("c2", DataType::Boolean, true),
+                        Field::new("c3", DataType::Int64, true),
+                        Field::new("c4", DataType::UInt32, true),
+                        Field::new("c1_non_null", DataType::Utf8, false),
+                        Field::new("c2_non_null", DataType::Boolean, false),
+                        Field::new("c3_non_null", DataType::Int64, false),
+                        Field::new("c4_non_null", DataType::UInt32, false),
+                        Field::new("c5", DataType::FixedSizeBinary(3), true),
+                    ]
+                    .into(),
+                    HashMap::new(),
+                )
+                .unwrap(),
             )
-            .unwrap(),
-        )
+        });
+        Arc::clone(&EXPR_TEST_SCHEMA)
     }
 
     #[test]
@@ -3430,6 +3690,142 @@ mod tests {
     }
 
     #[test]
+    fn simplify_literal_case_equality() {
+        // CASE WHEN c2 != false THEN "ok" ELSE "not_ok"
+        let simple_case = Expr::Case(Case::new(
+            None,
+            vec![(
+                Box::new(col("c2_non_null").not_eq(lit(false))),
+                Box::new(lit("ok")),
+            )],
+            Some(Box::new(lit("not_ok"))),
+        ));
+
+        // CASE WHEN c2 != false THEN "ok" ELSE "not_ok" == "ok"
+        // -->
+        // CASE WHEN c2 != false THEN "ok" == "ok" ELSE "not_ok" == "ok"
+        // -->
+        // CASE WHEN c2 != false THEN true ELSE false
+        // -->
+        // c2
+        assert_eq!(
+            simplify(binary_expr(simple_case.clone(), Operator::Eq, lit("ok"),)),
+            col("c2_non_null"),
+        );
+
+        // CASE WHEN c2 != false THEN "ok" ELSE "not_ok" != "ok"
+        // -->
+        // NOT(CASE WHEN c2 != false THEN "ok" == "ok" ELSE "not_ok" == "ok")
+        // -->
+        // NOT(CASE WHEN c2 != false THEN true ELSE false)
+        // -->
+        // NOT(c2)
+        assert_eq!(
+            simplify(binary_expr(simple_case, Operator::NotEq, lit("ok"),)),
+            not(col("c2_non_null")),
+        );
+
+        let complex_case = Expr::Case(Case::new(
+            None,
+            vec![
+                (
+                    Box::new(col("c1").eq(lit("inboxed"))),
+                    Box::new(lit("pending")),
+                ),
+                (
+                    Box::new(col("c1").eq(lit("scheduled"))),
+                    Box::new(lit("pending")),
+                ),
+                (
+                    Box::new(col("c1").eq(lit("completed"))),
+                    Box::new(lit("completed")),
+                ),
+                (
+                    Box::new(col("c1").eq(lit("paused"))),
+                    Box::new(lit("paused")),
+                ),
+                (Box::new(col("c2")), Box::new(lit("running"))),
+                (
+                    Box::new(col("c1").eq(lit("invoked")).and(col("c3").gt(lit(0)))),
+                    Box::new(lit("backing-off")),
+                ),
+            ],
+            Some(Box::new(lit("ready"))),
+        ));
+
+        assert_eq!(
+            simplify(binary_expr(
+                complex_case.clone(),
+                Operator::Eq,
+                lit("completed"),
+            )),
+            not_distinct_from(col("c1").eq(lit("completed")), lit(true)).and(
+                distinct_from(col("c1").eq(lit("inboxed")), lit(true))
+                    .and(distinct_from(col("c1").eq(lit("scheduled")), lit(true)))
+            )
+        );
+
+        assert_eq!(
+            simplify(binary_expr(
+                complex_case.clone(),
+                Operator::NotEq,
+                lit("completed"),
+            )),
+            distinct_from(col("c1").eq(lit("completed")), lit(true))
+                .or(not_distinct_from(col("c1").eq(lit("inboxed")), lit(true))
+                    .or(not_distinct_from(col("c1").eq(lit("scheduled")), lit(true))))
+        );
+
+        assert_eq!(
+            simplify(binary_expr(
+                complex_case.clone(),
+                Operator::Eq,
+                lit("running"),
+            )),
+            not_distinct_from(col("c2"), lit(true)).and(
+                distinct_from(col("c1").eq(lit("inboxed")), lit(true))
+                    .and(distinct_from(col("c1").eq(lit("scheduled")), lit(true)))
+                    .and(distinct_from(col("c1").eq(lit("completed")), lit(true)))
+                    .and(distinct_from(col("c1").eq(lit("paused")), lit(true)))
+            )
+        );
+
+        assert_eq!(
+            simplify(binary_expr(
+                complex_case.clone(),
+                Operator::Eq,
+                lit("ready"),
+            )),
+            distinct_from(col("c1").eq(lit("inboxed")), lit(true))
+                .and(distinct_from(col("c1").eq(lit("scheduled")), lit(true)))
+                .and(distinct_from(col("c1").eq(lit("completed")), lit(true)))
+                .and(distinct_from(col("c1").eq(lit("paused")), lit(true)))
+                .and(distinct_from(col("c2"), lit(true)))
+                .and(distinct_from(
+                    col("c1").eq(lit("invoked")).and(col("c3").gt(lit(0))),
+                    lit(true)
+                ))
+        );
+
+        assert_eq!(
+            simplify(binary_expr(
+                complex_case.clone(),
+                Operator::NotEq,
+                lit("ready"),
+            )),
+            not_distinct_from(col("c1").eq(lit("inboxed")), lit(true))
+                .or(not_distinct_from(col("c1").eq(lit("scheduled")), lit(true)))
+                .or(not_distinct_from(col("c1").eq(lit("completed")), lit(true)))
+                .or(not_distinct_from(col("c1").eq(lit("paused")), lit(true)))
+                .or(not_distinct_from(col("c2"), lit(true)))
+                .or(not_distinct_from(
+                    col("c1").eq(lit("invoked")).and(col("c3").gt(lit(0))),
+                    lit(true)
+                ))
+        );
+    }
+
+    #[test]
     fn simplify_expr_case_when_then_else() {
         // CASE WHEN c2 != false THEN "ok" == "not_ok" ELSE c2 == true
         // -->
@@ -3546,6 +3942,200 @@ mod tests {
             )))),
             not_distinct_from(col("c3").gt(lit(0_i64)), lit(true))
         );
+    }
+
+    #[test]
+    fn simplify_expr_case_when_first_true() {
+        // CASE WHEN true THEN 1 ELSE c1 END --> 1
+        assert_eq!(
+            simplify(Expr::Case(Case::new(
+                None,
+                vec![(Box::new(lit(true)), Box::new(lit(1)),)],
+                Some(Box::new(col("c1"))),
+            ))),
+            lit(1)
+        );
+
+        // CASE WHEN true THEN col('a') ELSE col('b') END --> col('a')
+        assert_eq!(
+            simplify(Expr::Case(Case::new(
+                None,
+                vec![(Box::new(lit(true)), Box::new(lit("a")),)],
+                Some(Box::new(lit("b"))),
+            ))),
+            lit("a")
+        );
+
+        // CASE WHEN true THEN col('a') WHEN col('x') > 5 THEN col('b') ELSE col('c') END --> col('a')
+        assert_eq!(
+            simplify(Expr::Case(Case::new(
+                None,
+                vec![
+                    (Box::new(lit(true)), Box::new(lit("a"))),
+                    (Box::new(lit("x").gt(lit(5))), Box::new(lit("b"))),
+                ],
+                Some(Box::new(lit("c"))),
+            ))),
+            lit("a")
+        );
+
+        // CASE WHEN true THEN col('a') END --> col('a') (no else clause)
+        assert_eq!(
+            simplify(Expr::Case(Case::new(
+                None,
+                vec![(Box::new(lit(true)), Box::new(lit("a")),)],
+                None,
+            ))),
+            lit("a")
+        );
+
+        // Negative test: CASE WHEN c2 THEN 1 ELSE 2 END should not be simplified
+        let expr = Expr::Case(Case::new(
+            None,
+            vec![(Box::new(col("c2")), Box::new(lit(1)))],
+            Some(Box::new(lit(2))),
+        ));
+        assert_eq!(simplify(expr.clone()), expr);
+
+        // Negative test: CASE WHEN false THEN 1 ELSE 2 END should not use this rule
+        let expr = Expr::Case(Case::new(
+            None,
+            vec![(Box::new(lit(false)), Box::new(lit(1)))],
+            Some(Box::new(lit(2))),
+        ));
+        assert_ne!(simplify(expr), lit(1));
+
+        // Negative test: CASE WHEN col('c1') > 5 THEN 1 ELSE 2 END should not be simplified
+        let expr = Expr::Case(Case::new(
+            None,
+            vec![(Box::new(col("c1").gt(lit(5))), Box::new(lit(1)))],
+            Some(Box::new(lit(2))),
+        ));
+        assert_eq!(simplify(expr.clone()), expr);
+    }
+
+    #[test]
+    fn simplify_expr_case_when_any_true() {
+        // CASE WHEN c3 > 0 THEN 'a' WHEN true THEN 'b' ELSE 'c' END --> CASE WHEN c3 > 0 THEN 'a' ELSE 'b' END
+        assert_eq!(
+            simplify(Expr::Case(Case::new(
+                None,
+                vec![
+                    (Box::new(col("c3").gt(lit(0))), Box::new(lit("a"))),
+                    (Box::new(lit(true)), Box::new(lit("b"))),
+                ],
+                Some(Box::new(lit("c"))),
+            ))),
+            Expr::Case(Case::new(
+                None,
+                vec![(Box::new(col("c3").gt(lit(0))), Box::new(lit("a")))],
+                Some(Box::new(lit("b"))),
+            ))
+        );
+
+        // CASE WHEN c3 > 0 THEN 'a' WHEN c4 < 0 THEN 'b' WHEN true THEN 'c' WHEN c3 = 0 THEN 'd' ELSE 'e' END
+        // --> CASE WHEN c3 > 0 THEN 'a' WHEN c4 < 0 THEN 'b' ELSE 'c' END
+        assert_eq!(
+            simplify(Expr::Case(Case::new(
+                None,
+                vec![
+                    (Box::new(col("c3").gt(lit(0))), Box::new(lit("a"))),
+                    (Box::new(col("c4").lt(lit(0))), Box::new(lit("b"))),
+                    (Box::new(lit(true)), Box::new(lit("c"))),
+                    (Box::new(col("c3").eq(lit(0))), Box::new(lit("d"))),
+                ],
+                Some(Box::new(lit("e"))),
+            ))),
+            Expr::Case(Case::new(
+                None,
+                vec![
+                    (Box::new(col("c3").gt(lit(0))), Box::new(lit("a"))),
+                    (Box::new(col("c4").lt(lit(0))), Box::new(lit("b"))),
+                ],
+                Some(Box::new(lit("c"))),
+            ))
+        );
+
+        // CASE WHEN c3 > 0 THEN 1 WHEN c4 < 0 THEN 2 WHEN true THEN 3 END (no else)
+        // --> CASE WHEN c3 > 0 THEN 1 WHEN c4 < 0 THEN 2 ELSE 3 END
+        assert_eq!(
+            simplify(Expr::Case(Case::new(
+                None,
+                vec![
+                    (Box::new(col("c3").gt(lit(0))), Box::new(lit(1))),
+                    (Box::new(col("c4").lt(lit(0))), Box::new(lit(2))),
+                    (Box::new(lit(true)), Box::new(lit(3))),
+                ],
+                None,
+            ))),
+            Expr::Case(Case::new(
+                None,
+                vec![
+                    (Box::new(col("c3").gt(lit(0))), Box::new(lit(1))),
+                    (Box::new(col("c4").lt(lit(0))), Box::new(lit(2))),
+                ],
+                Some(Box::new(lit(3))),
+            ))
+        );
+
+        // Negative test: CASE WHEN c3 > 0 THEN c3 WHEN c4 < 0 THEN 2 ELSE 3 END should not be simplified
+        let expr = Expr::Case(Case::new(
+            None,
+            vec![
+                (Box::new(col("c3").gt(lit(0))), Box::new(col("c3"))),
+                (Box::new(col("c4").lt(lit(0))), Box::new(lit(2))),
+            ],
+            Some(Box::new(lit(3))),
+        ));
+        assert_eq!(simplify(expr.clone()), expr);
+    }
+
+    #[test]
+    fn simplify_expr_case_when_any_false() {
+        // CASE WHEN false THEN 'a' END --> NULL
+        assert_eq!(
+            simplify(Expr::Case(Case::new(
+                None,
+                vec![(Box::new(lit(false)), Box::new(lit("a")))],
+                None,
+            ))),
+            Expr::Literal(ScalarValue::Utf8(None), None)
+        );
+
+        // CASE WHEN false THEN 2 ELSE 1 END --> 1
+        assert_eq!(
+            simplify(Expr::Case(Case::new(
+                None,
+                vec![(Box::new(lit(false)), Box::new(lit(2)))],
+                Some(Box::new(lit(1))),
+            ))),
+            lit(1),
+        );
+
+        // CASE WHEN c3 < 10 THEN 'b' WHEN false then c3 ELSE c4 END --> CASE WHEN c3 < 10 THEN b ELSE c4 END
+        assert_eq!(
+            simplify(Expr::Case(Case::new(
+                None,
+                vec![
+                    (Box::new(col("c3").lt(lit(10))), Box::new(lit("b"))),
+                    (Box::new(lit(false)), Box::new(col("c3"))),
+                ],
+                Some(Box::new(col("c4"))),
+            ))),
+            Expr::Case(Case::new(
+                None,
+                vec![(Box::new(col("c3").lt(lit(10))), Box::new(lit("b")))],
+                Some(Box::new(col("c4"))),
+            ))
+        );
+
+        // Negative test: CASE WHEN c3 = 4 THEN 1 ELSE 2 END should not be simplified
+        let expr = Expr::Case(Case::new(
+            None,
+            vec![(Box::new(col("c3").eq(lit(4))), Box::new(lit(1)))],
+            Some(Box::new(lit(2))),
+        ));
+        assert_eq!(simplify(expr.clone()), expr);
     }
 
     fn distinct_from(left: impl Into<Expr>, right: impl Into<Expr>) -> Expr {
@@ -3831,8 +4421,7 @@ mod tests {
     fn just_simplifier_simplify_null_in_empty_inlist() {
         let simplify = |expr: Expr| -> Expr {
             let schema = expr_test_schema();
-            let execution_props = ExecutionProps::new();
-            let info = SimplifyContext::new(&execution_props).with_schema(schema);
+            let info = SimplifyContext::default().with_schema(schema);
             let simplifier = &mut Simplifier::new(&info);
             expr.rewrite(simplifier)
                 .expect("Failed to simplify expression")
@@ -4183,22 +4772,24 @@ mod tests {
     }
 
     fn boolean_test_schema() -> DFSchemaRef {
-        Schema::new(vec![
-            Field::new("A", DataType::Boolean, false),
-            Field::new("B", DataType::Boolean, false),
-            Field::new("C", DataType::Boolean, false),
-            Field::new("D", DataType::Boolean, false),
-        ])
-        .to_dfschema_ref()
-        .unwrap()
+        static BOOLEAN_TEST_SCHEMA: LazyLock<DFSchemaRef> = LazyLock::new(|| {
+            Schema::new(vec![
+                Field::new("A", DataType::Boolean, false),
+                Field::new("B", DataType::Boolean, false),
+                Field::new("C", DataType::Boolean, false),
+                Field::new("D", DataType::Boolean, false),
+            ])
+            .to_dfschema_ref()
+            .unwrap()
+        });
+        Arc::clone(&BOOLEAN_TEST_SCHEMA)
     }
 
     #[test]
     fn simplify_common_factor_conjunction_in_disjunction() {
-        let props = ExecutionProps::new();
         let schema = boolean_test_schema();
         let simplifier =
-            ExprSimplifier::new(SimplifyContext::new(&props).with_schema(schema));
+            ExprSimplifier::new(SimplifyContext::default().with_schema(schema));
 
         let a = || col("A");
         let b = || col("B");
@@ -4313,8 +4904,6 @@ mod tests {
                 None
             }
         }
-
-        udf_equals_hash!(AggregateUDFImpl);
     }
 
     #[test]
@@ -4385,8 +4974,12 @@ mod tests {
         fn field(&self, _field_args: WindowUDFFieldArgs) -> Result<FieldRef> {
             unimplemented!("not needed for tests")
         }
+
+        fn limit_effect(&self, _args: &[Arc<dyn PhysicalExpr>]) -> LimitEffect {
+            LimitEffect::Unknown
+        }
     }
-    #[derive(Debug)]
+    #[derive(Debug, PartialEq, Eq, Hash)]
     struct VolatileUdf {
         signature: Signature,
     }
@@ -4485,11 +5078,215 @@ mod tests {
         );
     }
 
+    #[test]
+    fn simplify_cast_literal() {
+        // Test that CAST(literal) expressions are evaluated at plan time
+
+        // CAST(123 AS Int64) should become 123i64
+        let expr = Expr::Cast(Cast::new(Box::new(lit(123i32)), DataType::Int64));
+        let expected = lit(123i64);
+        assert_eq!(simplify(expr), expected);
+
+        // CAST(1761630189642 AS Timestamp(Nanosecond, Some("+00:00")))
+        // Integer to timestamp cast
+        let expr = Expr::Cast(Cast::new(
+            Box::new(lit(1761630189642i64)),
+            DataType::Timestamp(
+                arrow::datatypes::TimeUnit::Nanosecond,
+                Some("+00:00".into()),
+            ),
+        ));
+        // Should evaluate to a timestamp literal
+        let result = simplify(expr);
+        match result {
+            Expr::Literal(ScalarValue::TimestampNanosecond(Some(val), tz), _) => {
+                assert_eq!(val, 1761630189642i64);
+                assert_eq!(tz.as_deref(), Some("+00:00"));
+            }
+            other => panic!("Expected TimestampNanosecond literal, got: {other:?}"),
+        }
+
+        // Test CAST of invalid string to timestamp - should return an error at plan time
+        // This represents the case from the issue: CAST(Utf8("1761630189642") AS Timestamp)
+        // "1761630189642" is NOT a valid timestamp string format
+        let expr = Expr::Cast(Cast::new(
+            Box::new(lit("1761630189642")),
+            DataType::Timestamp(
+                arrow::datatypes::TimeUnit::Nanosecond,
+                Some("+00:00".into()),
+            ),
+        ));
+
+        // The simplification should now fail with an error at plan time
+        let schema = test_schema();
+        let simplifier =
+            ExprSimplifier::new(SimplifyContext::default().with_schema(schema));
+        let result = simplifier.simplify(expr);
+        assert!(result.is_err(), "Expected error for invalid cast");
+        let err_msg = result.unwrap_err().to_string();
+        assert_contains!(err_msg, "Error parsing timestamp");
+    }
+
     fn if_not_null(expr: Expr, then: bool) -> Expr {
         Expr::Case(Case {
             expr: Some(expr.is_not_null().into()),
             when_then_expr: vec![(lit(true).into(), lit(then).into())],
             else_expr: None,
         })
+    }
+
+    // --------------------------------
+    // --- Struct Cast Tests -----
+    // --------------------------------
+
+    /// Helper to create a `Struct` literal cast expression from `source_fields` and `target_fields`.
+    fn make_struct_cast_expr(source_fields: Fields, target_fields: Fields) -> Expr {
+        // Create 1-row struct array (not 0-row) so it can be evaluated by simplifier
+        let arrays: Vec<Arc<dyn Array>> = vec![
+            Arc::new(Int32Array::from(vec![Some(1)])),
+            Arc::new(Int32Array::from(vec![Some(2)])),
+        ];
+        let struct_array = StructArray::try_new(source_fields, arrays, None).unwrap();
+
+        Expr::Cast(Cast::new(
+            Box::new(Expr::Literal(
+                ScalarValue::Struct(Arc::new(struct_array)),
+                None,
+            )),
+            DataType::Struct(target_fields),
+        ))
+    }
+
+    #[test]
+    fn test_struct_cast_different_field_counts_not_foldable() {
+        // Test that struct casts with different field counts are NOT marked as foldable
+        // When field counts differ, const-folding should not be attempted
+
+        let source_fields = Fields::from(vec![
+            Arc::new(Field::new("a", DataType::Int32, true)),
+            Arc::new(Field::new("b", DataType::Int32, true)),
+        ]);
+
+        let target_fields = Fields::from(vec![
+            Arc::new(Field::new("x", DataType::Int32, true)),
+            Arc::new(Field::new("y", DataType::Int32, true)),
+            Arc::new(Field::new("z", DataType::Int32, true)),
+        ]);
+
+        let expr = make_struct_cast_expr(source_fields, target_fields);
+
+        let simplifier =
+            ExprSimplifier::new(SimplifyContext::default().with_schema(test_schema()));
+
+        // The cast should remain unchanged since field counts differ
+        let result = simplifier.simplify(expr.clone()).unwrap();
+        // Ensure const-folding was not attempted (the expression remains exactly the same)
+        assert_eq!(
+            result, expr,
+            "Struct cast with different field counts should remain unchanged (no const-folding)"
+        );
+    }
+
+    #[test]
+    fn test_struct_cast_same_field_count_foldable() {
+        // Test that struct casts with same field counts can be considered for const-folding
+
+        let source_fields = Fields::from(vec![
+            Arc::new(Field::new("a", DataType::Int32, true)),
+            Arc::new(Field::new("b", DataType::Int32, true)),
+        ]);
+
+        let target_fields = Fields::from(vec![
+            Arc::new(Field::new("a", DataType::Int32, true)),
+            Arc::new(Field::new("b", DataType::Int32, true)),
+        ]);
+
+        let expr = make_struct_cast_expr(source_fields, target_fields);
+
+        let simplifier =
+            ExprSimplifier::new(SimplifyContext::default().with_schema(test_schema()));
+
+        // The cast should be simplified
+        let result = simplifier.simplify(expr.clone()).unwrap();
+        // Struct casts with same field count should be const-folded to a literal
+        assert!(matches!(result, Expr::Literal(_, _)));
+        // Ensure the simplifier made a change (not identical to original)
+        assert_ne!(
+            result, expr,
+            "Struct cast with same field count should be simplified (not identical to input)"
+        );
+    }
+
+    #[test]
+    fn test_struct_cast_different_names_same_count() {
+        // Test struct cast with same field count but different names
+        // Field count matches; simplification should succeed
+
+        let source_fields = Fields::from(vec![
+            Arc::new(Field::new("a", DataType::Int32, true)),
+            Arc::new(Field::new("b", DataType::Int32, true)),
+        ]);
+
+        let target_fields = Fields::from(vec![
+            Arc::new(Field::new("x", DataType::Int32, true)),
+            Arc::new(Field::new("y", DataType::Int32, true)),
+        ]);
+
+        let expr = make_struct_cast_expr(source_fields, target_fields);
+
+        let simplifier =
+            ExprSimplifier::new(SimplifyContext::default().with_schema(test_schema()));
+
+        // The cast should be simplified since field counts match
+        let result = simplifier.simplify(expr.clone()).unwrap();
+        // Struct casts with same field count are const-folded to literals
+        assert!(matches!(result, Expr::Literal(_, _)));
+        // Ensure the simplifier made a change (not identical to original)
+        assert_ne!(
+            result, expr,
+            "Struct cast with different names but same field count should be simplified"
+        );
+    }
+
+    #[test]
+    fn test_struct_cast_empty_array_not_foldable() {
+        // Test that struct casts with 0-row (empty) struct arrays are NOT const-folded
+        // The simplifier uses a 1-row input batch, which causes dimension mismatches
+        // when evaluating 0-row struct literals
+
+        let source_fields = Fields::from(vec![
+            Arc::new(Field::new("a", DataType::Int32, true)),
+            Arc::new(Field::new("b", DataType::Int32, true)),
+        ]);
+
+        let target_fields = Fields::from(vec![
+            Arc::new(Field::new("a", DataType::Int32, true)),
+            Arc::new(Field::new("b", DataType::Int32, true)),
+        ]);
+
+        // Create a 0-row (empty) struct array
+        let arrays: Vec<Arc<dyn Array>> = vec![
+            Arc::new(Int32Array::new(vec![].into(), None)),
+            Arc::new(Int32Array::new(vec![].into(), None)),
+        ];
+        let struct_array = StructArray::try_new(source_fields, arrays, None).unwrap();
+
+        let expr = Expr::Cast(Cast::new(
+            Box::new(Expr::Literal(
+                ScalarValue::Struct(Arc::new(struct_array)),
+                None,
+            )),
+            DataType::Struct(target_fields),
+        ));
+
+        let simplifier =
+            ExprSimplifier::new(SimplifyContext::default().with_schema(test_schema()));
+
+        // The cast should remain unchanged since the struct array is empty (0-row)
+        let result = simplifier.simplify(expr.clone()).unwrap();
+        assert_eq!(
+            result, expr,
+            "Struct cast with empty (0-row) array should remain unchanged"
+        );
     }
 }

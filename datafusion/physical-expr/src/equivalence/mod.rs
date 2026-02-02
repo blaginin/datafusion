@@ -25,14 +25,15 @@ use datafusion_physical_expr_common::sort_expr::{LexOrdering, PhysicalSortExpr};
 
 mod class;
 mod ordering;
-mod projection;
 mod properties;
 
 pub use class::{AcrossPartitions, ConstExpr, EquivalenceClass, EquivalenceGroup};
 pub use ordering::OrderingEquivalenceClass;
-pub use projection::ProjectionMapping;
+// Re-export for backwards compatibility, we recommend importing from
+// datafusion_physical_expr::projection instead
+pub use crate::projection::{ProjectionMapping, project_ordering, project_orderings};
 pub use properties::{
-    calculate_union, join_equivalence_properties, EquivalenceProperties,
+    EquivalenceProperties, calculate_union, join_equivalence_properties,
 };
 
 // Convert each tuple to a `PhysicalSortExpr` and construct a vector.
@@ -56,12 +57,12 @@ pub fn convert_to_orderings<T: Borrow<Arc<dyn PhysicalExpr>>>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::expressions::{col, Column};
+    use crate::expressions::{Column, col};
     use crate::{LexRequirement, PhysicalSortExpr};
 
     use arrow::compute::SortOptions;
     use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
-    use datafusion_common::{plan_err, Result};
+    use datafusion_common::Result;
     use datafusion_physical_expr_common::sort_expr::PhysicalSortRequirement;
 
     /// Converts a string to a physical sort expression
@@ -93,31 +94,6 @@ mod tests {
         );
 
         sort_expr
-    }
-
-    pub fn output_schema(
-        mapping: &ProjectionMapping,
-        input_schema: &Arc<Schema>,
-    ) -> Result<SchemaRef> {
-        // Calculate output schema:
-        let mut fields = vec![];
-        for (source, targets) in mapping.iter() {
-            let data_type = source.data_type(input_schema)?;
-            let nullable = source.nullable(input_schema)?;
-            for (target, _) in targets.iter() {
-                let Some(column) = target.as_any().downcast_ref::<Column>() else {
-                    return plan_err!("Expects to have column");
-                };
-                fields.push(Field::new(column.name(), data_type.clone(), nullable));
-            }
-        }
-
-        let output_schema = Arc::new(Schema::new_with_metadata(
-            fields,
-            input_schema.metadata().clone(),
-        ));
-
-        Ok(output_schema)
     }
 
     // Generate a schema which consists of 8 columns (a, b, c, d, e, f, g, h)

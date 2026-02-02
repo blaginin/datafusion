@@ -23,11 +23,11 @@ concurrency:
 
 on:
   push:
+    branches:
+      - main
     paths:
       - "**/Cargo.toml"
       - "**/Cargo.lock"
-    branches:
-      - main
 
   pull_request:
     paths:
@@ -40,10 +40,12 @@ jobs:
   security_audit:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
       - name: Install cargo-audit
-        run: cargo install cargo-audit
+        uses: taiki-e/install-action@710817a1645ef40daad5bcde7431ceccf6cc3528  # v2.67.13
+        with:
+          tool: cargo-audit
       - name: Run audit check
-        # Ignored until https://github.com/apache/datafusion/issues/15571
-        # ignored py03 warning until arrow 55 upgrade
-        run: cargo audit --ignore RUSTSEC-2024-0370 --ignore RUSTSEC-2025-0020
+        # Note: you can ignore specific RUSTSEC issues using the `--ignore` flag ,for example:
+        # run: cargo audit --ignore RUSTSEC-2026-0001
+        run: cargo audit

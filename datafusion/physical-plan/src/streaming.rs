@@ -23,18 +23,18 @@ use std::sync::Arc;
 
 use super::{DisplayAs, DisplayFormatType, PlanProperties};
 use crate::coop::make_cooperative;
-use crate::display::{display_orderings, ProjectSchemaDisplay};
+use crate::display::{ProjectSchemaDisplay, display_orderings};
 use crate::execution_plan::{Boundedness, EmissionType, SchedulingType};
 use crate::limit::LimitStream;
 use crate::metrics::{BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet};
 use crate::projection::{
-    all_alias_free_columns, new_projections_for_columns, update_ordering, ProjectionExec,
+    ProjectionExec, all_alias_free_columns, new_projections_for_columns, update_ordering,
 };
 use crate::stream::RecordBatchStreamAdapter;
 use crate::{ExecutionPlan, Partitioning, SendableRecordBatchStream};
 
 use arrow::datatypes::{Schema, SchemaRef};
-use datafusion_common::{internal_err, plan_err, Result};
+use datafusion_common::{Result, internal_err, plan_err};
 use datafusion_execution::TaskContext;
 use datafusion_physical_expr::{EquivalenceProperties, LexOrdering};
 
@@ -299,7 +299,7 @@ impl ExecutionPlan for StreamingTableExec {
         let streaming_table_projections =
             self.projection().as_ref().map(|i| i.as_ref().to_vec());
         let new_projections = new_projections_for_columns(
-            projection,
+            projection.expr(),
             &streaming_table_projections
                 .unwrap_or_else(|| (0..self.schema().fields().len()).collect()),
         );
@@ -346,7 +346,7 @@ mod test {
     use super::*;
     use crate::collect_partitioned;
     use crate::streaming::PartitionStream;
-    use crate::test::{make_partition, TestPartitionStream};
+    use crate::test::{TestPartitionStream, make_partition};
     use arrow::record_batch::RecordBatch;
 
     #[tokio::test]

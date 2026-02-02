@@ -27,13 +27,13 @@ use std::mem;
 use std::sync::Arc;
 
 use self::dependency::{
-    construct_prefix_orderings, generate_dependency_orderings, referred_dependencies,
-    Dependencies, DependencyMap,
+    Dependencies, DependencyMap, construct_prefix_orderings,
+    generate_dependency_orderings, referred_dependencies,
 };
 use crate::equivalence::{
     AcrossPartitions, EquivalenceGroup, OrderingEquivalenceClass, ProjectionMapping,
 };
-use crate::expressions::{with_new_schema, CastExpr, Column, Literal};
+use crate::expressions::{CastExpr, Column, Literal, with_new_schema};
 use crate::{
     ConstExpr, LexOrdering, LexRequirement, PhysicalExpr, PhysicalSortExpr,
     PhysicalSortRequirement,
@@ -41,7 +41,7 @@ use crate::{
 
 use arrow::datatypes::SchemaRef;
 use datafusion_common::tree_node::{Transformed, TransformedResult, TreeNode};
-use datafusion_common::{plan_err, Constraint, Constraints, HashMap, Result};
+use datafusion_common::{Constraint, Constraints, HashMap, Result, plan_err};
 use datafusion_expr::interval_arithmetic::Interval;
 use datafusion_expr::sort_properties::{ExprProperties, SortProperties};
 use datafusion_physical_expr_common::sort_expr::options_compatible;
@@ -123,11 +123,14 @@ use itertools::Itertools;
 /// let mut eq_properties = EquivalenceProperties::new(schema);
 /// eq_properties.add_constants(vec![ConstExpr::from(col_b)]);
 /// eq_properties.add_ordering([
-///   PhysicalSortExpr::new_default(col_a).asc(),
-///   PhysicalSortExpr::new_default(col_c).desc(),
+///     PhysicalSortExpr::new_default(col_a).asc(),
+///     PhysicalSortExpr::new_default(col_c).desc(),
 /// ]);
 ///
-/// assert_eq!(eq_properties.to_string(), "order: [[a@0 ASC, c@2 DESC]], eq: [{members: [b@1], constant: (heterogeneous)}]");
+/// assert_eq!(
+///     eq_properties.to_string(),
+///     "order: [[a@0 ASC, c@2 DESC]], eq: [{members: [b@1], constant: (heterogeneous)}]"
+/// );
 /// ```
 #[derive(Clone, Debug)]
 pub struct EquivalenceProperties {
@@ -255,10 +258,11 @@ impl EquivalenceProperties {
     pub fn constants(&self) -> Vec<ConstExpr> {
         self.eq_group
             .iter()
-            .filter_map(|c| {
-                c.constant.as_ref().and_then(|across| {
-                    c.canonical_expr()
-                        .map(|expr| ConstExpr::new(Arc::clone(expr), across.clone()))
+            .flat_map(|c| {
+                c.iter().filter_map(|expr| {
+                    c.constant
+                        .as_ref()
+                        .map(|across| ConstExpr::new(Arc::clone(expr), across.clone()))
                 })
             })
             .collect()
@@ -315,7 +319,7 @@ impl EquivalenceProperties {
             self.oeq_class.extend(orderings);
             // Normalize given orderings to update the cache:
             self.oeq_cache.normal_cls.extend(normal_orderings);
-            // TODO: If no ordering is found to be redunant during extension, we
+            // TODO: If no ordering is found to be redundant during extension, we
             //       can use a shortcut algorithm to update the leading map.
             self.oeq_cache.update_map();
         }
@@ -326,6 +330,22 @@ impl EquivalenceProperties {
         self.add_orderings(std::iter::once(ordering));
     }
 
+    fn update_oeq_cache(&mut self) -> Result<()> {
+        // Renormalize orderings if the equivalence group changes:
+        let normal_cls = mem::take(&mut self.oeq_cache.normal_cls);
+        let normal_orderings = normal_cls
+            .into_iter()
+            .map(|o| self.eq_group.normalize_sort_exprs(o));
+        self.oeq_cache.normal_cls = OrderingEquivalenceClass::new(normal_orderings);
+        self.oeq_cache.update_map();
+        // Discover any new orderings based on the new equivalence classes:
+        let leading_exprs: Vec<_> = self.oeq_cache.leading_map.keys().cloned().collect();
+        for expr in leading_exprs {
+            self.discover_new_orderings(expr)?;
+        }
+        Ok(())
+    }
+
     /// Incorporates the given equivalence group to into the existing
     /// equivalence group within.
     pub fn add_equivalence_group(
@@ -334,19 +354,7 @@ impl EquivalenceProperties {
     ) -> Result<()> {
         if !other_eq_group.is_empty() {
             self.eq_group.extend(other_eq_group);
-            // Renormalize orderings if the equivalence group changes:
-            let normal_cls = mem::take(&mut self.oeq_cache.normal_cls);
-            let normal_orderings = normal_cls
-                .into_iter()
-                .map(|o| self.eq_group.normalize_sort_exprs(o));
-            self.oeq_cache.normal_cls = OrderingEquivalenceClass::new(normal_orderings);
-            self.oeq_cache.update_map();
-            // Discover any new orderings based on the new equivalence classes:
-            let leading_exprs: Vec<_> =
-                self.oeq_cache.leading_map.keys().cloned().collect();
-            for expr in leading_exprs {
-                self.discover_new_orderings(expr)?;
-            }
+            self.update_oeq_cache()?;
         }
         Ok(())
     }
@@ -372,17 +380,10 @@ impl EquivalenceProperties {
         right: Arc<dyn PhysicalExpr>,
     ) -> Result<()> {
         // Add equal expressions to the state:
-        if self.eq_group.add_equal_conditions(Arc::clone(&left), right) {
-            // Renormalize orderings if the equivalence group changes:
-            let normal_cls = mem::take(&mut self.oeq_cache.normal_cls);
-            let normal_orderings = normal_cls
-                .into_iter()
-                .map(|o| self.eq_group.normalize_sort_exprs(o));
-            self.oeq_cache.normal_cls = OrderingEquivalenceClass::new(normal_orderings);
-            self.oeq_cache.update_map();
-            // Discover any new orderings:
-            self.discover_new_orderings(left)?;
+        if self.eq_group.add_equal_conditions(left, right) {
+            self.update_oeq_cache()?;
         }
+        self.update_oeq_cache()?;
         Ok(())
     }
 
@@ -1276,7 +1277,7 @@ impl EquivalenceProperties {
             // Rewriting equivalence properties in terms of new schema is not
             // safe when schemas are not aligned:
             return plan_err!(
-                "Schemas have to be aligned to rewrite equivalences:\n Old schema: {:?}\n New schema: {:?}",
+                "Schemas have to be aligned to rewrite equivalences:\n Old schema: {}\n New schema: {}",
                 self.schema,
                 schema
             );

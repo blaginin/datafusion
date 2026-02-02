@@ -22,12 +22,14 @@ use arrow::array::{Array, Int64Array};
 use arrow::datatypes::DataType;
 use arrow::datatypes::DataType::{Int32, Int64};
 use datafusion_common::cast::as_int32_array;
-use datafusion_common::{exec_err, DataFusionError, Result, ScalarValue};
+use datafusion_common::{
+    DataFusionError, Result, ScalarValue, exec_err, utils::take_function_args,
+};
 use datafusion_expr::Signature;
 use datafusion_expr::{ColumnarValue, ScalarFunctionArgs, ScalarUDFImpl, Volatility};
 
 /// <https://spark.apache.org/docs/latest/api/sql/index.html#factorial>
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 pub struct SparkFactorial {
     signature: Signature,
     aliases: Vec<String>,
@@ -99,19 +101,15 @@ const FACTORIALS: [i64; 21] = [
 ];
 
 pub fn spark_factorial(args: &[ColumnarValue]) -> Result<ColumnarValue, DataFusionError> {
-    if args.len() != 1 {
-        return Err(DataFusionError::Internal(
-            "`factorial` expects exactly one argument".to_string(),
-        ));
-    }
+    let [arg] = take_function_args("factorial", args)?;
 
-    match &args[0] {
+    match arg {
         ColumnarValue::Scalar(ScalarValue::Int32(value)) => {
             let result = compute_factorial(*value);
             Ok(ColumnarValue::Scalar(ScalarValue::Int64(result)))
         }
         ColumnarValue::Scalar(other) => {
-            exec_err!("`factorial` got an unexpected scalar type: {:?}", other)
+            exec_err!("`factorial` got an unexpected scalar type: {}", other)
         }
         ColumnarValue::Array(array) => match array.data_type() {
             Int32 => {
@@ -122,7 +120,7 @@ pub fn spark_factorial(args: &[ColumnarValue]) -> Result<ColumnarValue, DataFusi
                 Ok(ColumnarValue::Array(Arc::new(result)))
             }
             other => {
-                exec_err!("`factorial` got an unexpected argument type: {:?}", other)
+                exec_err!("`factorial` got an unexpected argument type: {}", other)
             }
         },
     }
@@ -138,8 +136,8 @@ fn compute_factorial(num: Option<i32>) -> Option<i64> {
 mod test {
     use crate::function::math::factorial::spark_factorial;
     use arrow::array::{Int32Array, Int64Array};
-    use datafusion_common::cast::as_int64_array;
     use datafusion_common::ScalarValue;
+    use datafusion_common::cast::as_int64_array;
     use datafusion_expr::ColumnarValue;
     use std::sync::Arc;
 

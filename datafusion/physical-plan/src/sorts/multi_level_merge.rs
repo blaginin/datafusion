@@ -30,7 +30,7 @@ use arrow::datatypes::SchemaRef;
 use datafusion_common::Result;
 use datafusion_execution::memory_pool::MemoryReservation;
 
-use crate::sorts::sort::get_reserved_byte_for_record_batch_size;
+use crate::sorts::sort::get_reserved_bytes_for_record_batch_size;
 use crate::sorts::streaming_merge::{SortedSpillFile, StreamingMergeBuilder};
 use crate::stream::RecordBatchStreamAdapter;
 use datafusion_execution::{RecordBatchStream, SendableRecordBatchStream};
@@ -125,7 +125,6 @@ use futures::{Stream, StreamExt};
 ///    available during merge operations.
 /// 2. **Adaptive Buffer Sizing**: Reduces buffer sizes when memory is constrained
 /// 3. **Spill-to-Disk**: Spill to disk when we cannot merge all files in memory
-///
 pub(crate) struct MultiLevelMergeBuilder {
     spill_manager: SpillManager,
     schema: SchemaRef,
@@ -146,7 +145,7 @@ impl Debug for MultiLevelMergeBuilder {
 }
 
 impl MultiLevelMergeBuilder {
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     pub(crate) fn new(
         spill_manager: SpillManager,
         schema: SchemaRef,
@@ -237,7 +236,8 @@ impl MultiLevelMergeBuilder {
                 let spill_file = self.sorted_spill_files.remove(0);
 
                 // Not reserving any memory for this disk as we are not holding it in memory
-                self.spill_manager.read_spill_as_stream(spill_file.file)
+                self.spill_manager
+                    .read_spill_as_stream(spill_file.file, None)
             }
 
             // Only in memory streams, so merge them all in a single pass
@@ -274,10 +274,12 @@ impl MultiLevelMergeBuilder {
                         .spill_manager
                         .clone()
                         .with_batch_read_buffer_capacity(buffer_size)
-                        .read_spill_as_stream(spill.file)?;
+                        .read_spill_as_stream(
+                            spill.file,
+                            Some(spill.max_record_batch_memory),
+                        )?;
                     sorted_streams.push(stream);
                 }
-
                 let merge_sort_stream = self.create_new_merge_sort(
                     sorted_streams,
                     // If we have no sorted spill files left, this is the last run
@@ -288,7 +290,11 @@ impl MultiLevelMergeBuilder {
                 // If we're only merging memory streams, we don't need to attach the memory reservation
                 // as it's empty
                 if is_only_merging_memory_streams {
-                    assert_eq!(memory_reservation.size(), 0, "when only merging memory streams, we should not have any memory reservation and let the merge sort handle the memory");
+                    assert_eq!(
+                        memory_reservation.size(),
+                        0,
+                        "when only merging memory streams, we should not have any memory reservation and let the merge sort handle the memory"
+                    );
 
                     Ok(merge_sort_stream)
                 } else {
@@ -354,9 +360,13 @@ impl MultiLevelMergeBuilder {
         for spill in &self.sorted_spill_files {
             // For memory pools that are not shared this is good, for other this is not
             // and there should be some upper limit to memory reservation so we won't starve the system
-            match reservation.try_grow(get_reserved_byte_for_record_batch_size(
-                spill.max_record_batch_memory * buffer_len,
-            )) {
+            match reservation.try_grow(
+                get_reserved_bytes_for_record_batch_size(
+                    spill.max_record_batch_memory,
+                    // Size will be the same as the sliced size, bc it is a spilled batch.
+                    spill.max_record_batch_memory,
+                ) * buffer_len,
+            ) {
                 Ok(_) => {
                     number_of_spills_to_read_for_current_phase += 1;
                 }

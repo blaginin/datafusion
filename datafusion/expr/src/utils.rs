@@ -24,7 +24,7 @@ use std::sync::Arc;
 use crate::expr::{Alias, Sort, WildcardOptions, WindowFunctionParams};
 use crate::expr_rewriter::strip_outer_reference;
 use crate::{
-    and, BinaryExpr, Expr, ExprSchemable, Filter, GroupingSet, LogicalPlan, Operator,
+    BinaryExpr, Expr, ExprSchemable, Filter, GroupingSet, LogicalPlan, Operator, and,
 };
 use datafusion_expr_common::signature::{Signature, TypeSignature};
 
@@ -34,11 +34,14 @@ use datafusion_common::tree_node::{
 };
 use datafusion_common::utils::get_at_indices;
 use datafusion_common::{
-    internal_err, plan_datafusion_err, plan_err, Column, DFSchema, DFSchemaRef, HashMap,
-    Result, TableReference,
+    Column, DFSchema, DFSchemaRef, HashMap, Result, TableReference, internal_err,
+    plan_err,
 };
 
+#[cfg(not(feature = "sql"))]
+use crate::expr::{ExceptSelectItem, ExcludeSelectItem};
 use indexmap::IndexSet;
+#[cfg(feature = "sql")]
 use sqlparser::ast::{ExceptSelectItem, ExcludeSelectItem};
 
 pub use datafusion_functions_aggregate_common::order::AggregateOrderSensitivity;
@@ -63,6 +66,23 @@ pub fn grouping_set_expr_count(group_expr: &[Expr]) -> Result<usize> {
     }
 }
 
+/// Internal helper that generates indices for powerset subsets using bitset iteration.
+/// Returns an iterator of index vectors, where each vector contains the indices
+/// of elements to include in that subset.
+fn powerset_indices(len: usize) -> impl Iterator<Item = Vec<usize>> {
+    (0..(1 << len)).map(move |mask| {
+        let mut indices = vec![];
+        let mut bitset = mask;
+        while bitset > 0 {
+            let rightmost: u64 = bitset & !(bitset - 1);
+            let idx = rightmost.trailing_zeros() as usize;
+            indices.push(idx);
+            bitset &= bitset - 1;
+        }
+        indices
+    })
+}
+
 /// The [power set] (or powerset) of a set S is the set of all subsets of S, \
 /// including the empty set and S itself.
 ///
@@ -80,33 +100,23 @@ pub fn grouping_set_expr_count(group_expr: &[Expr]) -> Result<usize> {
 ///  and hence the power set of S is {{}, {x}, {y}, {z}, {x, y}, {x, z}, {y, z}, {x, y, z}}.
 ///
 /// [power set]: https://en.wikipedia.org/wiki/Power_set
-fn powerset<T>(slice: &[T]) -> Result<Vec<Vec<&T>>, String> {
+pub fn powerset<T>(slice: &[T]) -> Result<Vec<Vec<&T>>> {
     if slice.len() >= 64 {
-        return Err("The size of the set must be less than 64.".into());
+        return plan_err!("The size of the set must be less than 64");
     }
 
-    let mut v = Vec::new();
-    for mask in 0..(1 << slice.len()) {
-        let mut ss = vec![];
-        let mut bitset = mask;
-        while bitset > 0 {
-            let rightmost: u64 = bitset & !(bitset - 1);
-            let idx = rightmost.trailing_zeros();
-            let item = slice.get(idx as usize).unwrap();
-            ss.push(item);
-            // zero the trailing bit
-            bitset &= bitset - 1;
-        }
-        v.push(ss);
-    }
-    Ok(v)
+    Ok(powerset_indices(slice.len())
+        .map(|indices| indices.iter().map(|&idx| &slice[idx]).collect())
+        .collect())
 }
 
 /// check the number of expressions contained in the grouping_set
 fn check_grouping_set_size_limit(size: usize) -> Result<()> {
     let max_grouping_set_size = 65535;
     if size > max_grouping_set_size {
-        return plan_err!("The number of group_expression in grouping_set exceeds the maximum limit {max_grouping_set_size}, found {size}");
+        return plan_err!(
+            "The number of group_expression in grouping_set exceeds the maximum limit {max_grouping_set_size}, found {size}"
+        );
     }
 
     Ok(())
@@ -116,7 +126,9 @@ fn check_grouping_set_size_limit(size: usize) -> Result<()> {
 fn check_grouping_sets_size_limit(size: usize) -> Result<()> {
     let max_grouping_sets_size = 4096;
     if size > max_grouping_sets_size {
-        return plan_err!("The number of grouping_set in grouping_sets exceeds the maximum limit {max_grouping_sets_size}, found {size}");
+        return plan_err!(
+            "The number of grouping_set in grouping_sets exceeds the maximum limit {max_grouping_sets_size}, found {size}"
+        );
     }
 
     Ok(())
@@ -204,8 +216,7 @@ pub fn enumerate_grouping_sets(group_expr: Vec<Expr>) -> Result<Vec<Expr>> {
                     grouping_sets.iter().map(|e| e.iter().collect()).collect()
                 }
                 Expr::GroupingSet(GroupingSet::Cube(group_exprs)) => {
-                    let grouping_sets = powerset(group_exprs)
-                        .map_err(|e| plan_datafusion_err!("{}", e))?;
+                    let grouping_sets = powerset(group_exprs)?;
                     check_grouping_sets_size_limit(grouping_sets.len())?;
                     grouping_sets
                 }
@@ -301,6 +312,7 @@ pub fn expr_to_columns(expr: &Expr, accum: &mut HashSet<Column>) -> Result<()> {
             | Expr::InList { .. }
             | Expr::Exists { .. }
             | Expr::InSubquery(_)
+            | Expr::SetComparison(_)
             | Expr::ScalarSubquery(_)
             | Expr::Wildcard { .. }
             | Expr::Placeholder(_)
@@ -351,7 +363,7 @@ fn get_excluded_columns(
 /// Returns all `Expr`s in the schema, except the `Column`s in the `columns_to_skip`
 fn get_exprs_except_skipped(
     schema: &DFSchema,
-    columns_to_skip: HashSet<Column>,
+    columns_to_skip: &HashSet<Column>,
 ) -> Vec<Expr> {
     if columns_to_skip.is_empty() {
         schema.iter().map(Expr::from).collect::<Vec<Expr>>()
@@ -416,7 +428,7 @@ pub fn expand_wildcard(
     };
     // Add each excluded `Column` to columns_to_skip
     columns_to_skip.extend(excluded_columns);
-    Ok(get_exprs_except_skipped(schema, columns_to_skip))
+    Ok(get_exprs_except_skipped(schema, &columns_to_skip))
 }
 
 /// Resolves an `Expr::Wildcard` to a collection of qualified `Expr::Column`'s.
@@ -461,7 +473,7 @@ pub fn expand_qualified_wildcard(
     columns_to_skip.extend(excluded_columns);
     Ok(get_exprs_except_skipped(
         &qualified_dfschema,
-        columns_to_skip,
+        &columns_to_skip,
     ))
 }
 
@@ -690,7 +702,23 @@ where
     err
 }
 
-/// Create field meta-data from an expression, for use in a result set schema
+/// Create schema fields from an expression list, for use in result set schema construction
+///
+/// This function converts a list of expressions into a list of complete schema fields,
+/// making comprehensive determinations about each field's properties including:
+/// - **Data type**: Resolved based on expression type and input schema context
+/// - **Nullability**: Determined by expression-specific nullability rules
+/// - **Metadata**: Computed based on expression type (preserving, merging, or generating new metadata)
+/// - **Table reference scoping**: Establishing proper qualified field references
+///
+/// Each expression is converted to a field by calling [`Expr::to_field`], which performs
+/// the complete field resolution process for all field properties.
+///
+/// # Returns
+///
+/// A `Result` containing a vector of `(Option<TableReference>, Arc<Field>)` tuples,
+/// where each Field contains complete schema information (type, nullability, metadata)
+/// and proper table reference scoping for the corresponding expression.
 pub fn exprlist_to_fields<'a>(
     exprs: impl IntoIterator<Item = &'a Expr>,
     plan: &LogicalPlan,
@@ -871,7 +899,6 @@ pub fn check_all_columns_from_schema(
 ///    all referenced column of the right side is from the right schema.
 /// 2. Or opposite. All referenced column of the left side is from the right schema,
 ///    and the right side is from the left schema.
-///
 pub fn find_valid_equijoin_key_pair(
     left_key: &Expr,
     right_key: &Expr,
@@ -910,6 +937,8 @@ pub fn find_valid_equijoin_key_pair(
 ///     round(Float64)
 ///     round(Float32)
 /// ```
+#[expect(clippy::needless_pass_by_value)]
+#[deprecated(since = "53.0.0", note = "Internal function")]
 pub fn generate_signature_error_msg(
     func_name: &str,
     func_signature: Signature,
@@ -917,16 +946,38 @@ pub fn generate_signature_error_msg(
 ) -> String {
     let candidate_signatures = func_signature
         .type_signature
-        .to_string_repr()
+        .to_string_repr_with_names(func_signature.parameter_names.as_deref())
         .iter()
         .map(|args_str| format!("\t{func_name}({args_str})"))
         .collect::<Vec<String>>()
         .join("\n");
 
     format!(
-            "No function matches the given name and argument types '{}({})'. You might need to add explicit type casts.\n\tCandidate functions:\n{}",
-            func_name, TypeSignature::join_types(input_expr_types, ", "), candidate_signatures
-        )
+        "No function matches the given name and argument types '{}({})'. You might need to add explicit type casts.\n\tCandidate functions:\n{}",
+        func_name,
+        TypeSignature::join_types(input_expr_types, ", "),
+        candidate_signatures
+    )
+}
+
+/// Creates a detailed error message for a function with wrong signature.
+///
+/// For example, a query like `select round(3.14, 1.1);` would yield:
+/// ```text
+/// Error during planning: No function matches 'round(Float64, Float64)'. You might need to add explicit type casts.
+///     Candidate functions:
+///     round(Float64, Int64)
+///     round(Float32, Int64)
+///     round(Float64)
+///     round(Float32)
+/// ```
+pub(crate) fn generate_signature_error_message(
+    func_name: &str,
+    func_signature: &Signature,
+    input_expr_types: &[DataType],
+) -> String {
+    #[expect(deprecated)]
+    generate_signature_error_msg(func_name, func_signature.clone(), input_expr_types)
 }
 
 /// Splits a conjunctive [`Expr`] such as `A AND B AND C` => `[A, B, C]`
@@ -1015,10 +1066,7 @@ pub fn iter_conjunction_owned(expr: Expr) -> impl Iterator<Item = Expr> {
 /// let expr = col("a").eq(lit(1)).and(col("b").eq(lit(2)));
 ///
 /// // [a=1, b=2]
-/// let split = vec![
-///   col("a").eq(lit(1)),
-///   col("b").eq(lit(2)),
-/// ];
+/// let split = vec![col("a").eq(lit(1)), col("b").eq(lit(2))];
 ///
 /// // use split_conjunction_owned to split them
 /// assert_eq!(split_conjunction_owned(expr), split);
@@ -1041,10 +1089,7 @@ pub fn split_conjunction_owned(expr: Expr) -> Vec<Expr> {
 /// let expr = col("a").eq(lit(1)).add(col("b").eq(lit(2)));
 ///
 /// // [a=1, b=2]
-/// let split = vec![
-///   col("a").eq(lit(1)),
-///   col("b").eq(lit(2)),
-/// ];
+/// let split = vec![col("a").eq(lit(1)), col("b").eq(lit(2))];
 ///
 /// // use split_binary_owned to split them
 /// assert_eq!(split_binary_owned(expr, Operator::Plus), split);
@@ -1112,10 +1157,7 @@ fn split_binary_impl<'a>(
 /// let expr = col("a").eq(lit(1)).and(col("b").eq(lit(2)));
 ///
 /// // [a=1, b=2]
-/// let split = vec![
-///   col("a").eq(lit(1)),
-///   col("b").eq(lit(2)),
-/// ];
+/// let split = vec![col("a").eq(lit(1)), col("b").eq(lit(2))];
 ///
 /// // use conjunction to join them together with `AND`
 /// assert_eq!(conjunction(split), Some(expr));
@@ -1138,10 +1180,7 @@ pub fn conjunction(filters: impl IntoIterator<Item = Expr>) -> Option<Expr> {
 /// let expr = col("a").eq(lit(1)).or(col("b").eq(lit(2)));
 ///
 /// // [a=1, b=2]
-/// let split = vec![
-///   col("a").eq(lit(1)),
-///   col("b").eq(lit(2)),
-/// ];
+/// let split = vec![col("a").eq(lit(1)), col("b").eq(lit(2))];
 ///
 /// // use disjunction to join them together with `OR`
 /// assert_eq!(disjunction(split), Some(expr));
@@ -1225,6 +1264,9 @@ pub fn only_or_err<T>(slice: &[T]) -> Result<&T> {
 }
 
 /// merge inputs schema into a single schema.
+///
+/// This function merges schemas from multiple logical plan inputs using [`DFSchema::merge`].
+/// Refer to that documentation for details on precedence and metadata handling.
 pub fn merge_schema(inputs: &[&LogicalPlan]) -> DFSchema {
     if inputs.len() == 1 {
         inputs[0].schema().as_ref().clone()
@@ -1262,102 +1304,17 @@ pub fn collect_subquery_cols(
     })
 }
 
-/// Generates implementation of `equals` and `hash_value` methods for a trait, delegating
-/// to [`PartialEq`] and [`Hash`] implementations on Self.
-/// Meant to be used with traits representing user-defined functions (UDFs).
-///
-/// Example showing generation of [`ScalarUDFImpl::equals`] and [`ScalarUDFImpl::hash_value`]
-/// implementations.
-///
-/// ```
-/// # use arrow::datatypes::DataType;
-/// # use datafusion_expr::{udf_equals_hash, ScalarFunctionArgs, ScalarUDFImpl};
-/// # use datafusion_expr_common::columnar_value::ColumnarValue;
-/// # use datafusion_expr_common::signature::Signature;
-/// # use std::any::Any;
-///
-/// // Implementing Eq & Hash is a prerequisite for using this macro,
-/// // but the implementation can be derived.
-/// #[derive(Debug, PartialEq, Eq, Hash)]
-/// struct VarcharToTimestampTz {
-///     safe: bool,
-/// }
-///
-/// impl ScalarUDFImpl for VarcharToTimestampTz {
-///     /* other methods omitted for brevity */
-/// #    fn as_any(&self) -> &dyn Any {
-/// #        self
-/// #    }
-/// #
-/// #    fn name(&self) -> &str {
-/// #        "varchar_to_timestamp_tz"
-/// #    }
-/// #
-/// #    fn signature(&self) -> &Signature {
-/// #        todo!()
-/// #    }
-/// #
-/// #    fn return_type(
-/// #        &self,
-/// #        _arg_types: &[DataType],
-/// #    ) -> datafusion_common::Result<DataType> {
-/// #        todo!()
-/// #    }
-/// #
-/// #    fn invoke_with_args(
-/// #        &self,
-/// #        args: ScalarFunctionArgs,
-/// #    ) -> datafusion_common::Result<ColumnarValue> {
-/// #        todo!()
-/// #    }
-/// #
-///     udf_equals_hash!(ScalarUDFImpl);
-/// }
-/// ```
-///
-/// [`ScalarUDFImpl::equals`]: crate::ScalarUDFImpl::equals
-/// [`ScalarUDFImpl::hash_value`]: crate::ScalarUDFImpl::hash_value
-#[macro_export]
-macro_rules! udf_equals_hash {
-    ($udf_type:tt) => {
-        fn equals(&self, other: &dyn $udf_type) -> bool {
-            use ::core::any::Any;
-            use ::core::cmp::{Eq, PartialEq};
-            let Some(other) = <dyn Any + 'static>::downcast_ref::<Self>(other.as_any())
-            else {
-                return false;
-            };
-            fn assert_self_impls_eq<T: Eq>() {}
-            assert_self_impls_eq::<Self>();
-            PartialEq::eq(self, other)
-        }
-
-        fn hash_value(&self) -> u64 {
-            use ::std::any::type_name;
-            use ::std::hash::{DefaultHasher, Hash, Hasher};
-            let hasher = &mut DefaultHasher::new();
-            type_name::<Self>().hash(hasher);
-            Hash::hash(self, hasher);
-            Hasher::finish(hasher)
-        }
-    };
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::{
-        col, cube,
+        Cast, ExprFunctionExt, WindowFunctionDefinition, col, cube,
         expr::WindowFunction,
         expr_vec_fmt, grouping_set, lit, rollup,
         test::function_stub::{max_udaf, min_udaf, sum_udaf},
-        Cast, ExprFunctionExt, ScalarFunctionArgs, ScalarUDFImpl,
-        WindowFunctionDefinition,
     };
     use arrow::datatypes::{UnionFields, UnionMode};
-    use datafusion_expr_common::columnar_value::ColumnarValue;
-    use datafusion_expr_common::signature::Volatility;
-    use std::any::Any;
+    use datafusion_expr_common::signature::{TypeSignature, Volatility};
 
     #[test]
     fn test_group_window_expr_by_sort_keys_empty_case() -> Result<()> {
@@ -1779,89 +1736,52 @@ mod tests {
     }
 
     #[test]
-    fn test_udf_equals_hash() {
-        #[derive(Debug, PartialEq, Hash)]
-        struct StatefulFunctionWithEqHash {
-            signature: Signature,
-            state: bool,
-        }
-        impl ScalarUDFImpl for StatefulFunctionWithEqHash {
-            fn as_any(&self) -> &dyn Any {
-                self
-            }
-            fn name(&self) -> &str {
-                "StatefulFunctionWithEqHash"
-            }
-            fn signature(&self) -> &Signature {
-                &self.signature
-            }
-            fn return_type(&self, _arg_types: &[DataType]) -> Result<DataType> {
-                todo!()
-            }
-            fn invoke_with_args(
-                &self,
-                _args: ScalarFunctionArgs,
-            ) -> Result<ColumnarValue> {
-                todo!()
-            }
-        }
+    fn test_generate_signature_error_msg_with_parameter_names() {
+        let sig = Signature::one_of(
+            vec![
+                TypeSignature::Exact(vec![DataType::Utf8, DataType::Int64]),
+                TypeSignature::Exact(vec![
+                    DataType::Utf8,
+                    DataType::Int64,
+                    DataType::Int64,
+                ]),
+            ],
+            Volatility::Immutable,
+        )
+        .with_parameter_names(vec![
+            "str".to_string(),
+            "start_pos".to_string(),
+            "length".to_string(),
+        ])
+        .expect("valid parameter names");
 
-        #[derive(Debug, PartialEq, Eq, Hash)]
-        struct StatefulFunctionWithEqHashWithUdfEqualsHash {
-            signature: Signature,
-            state: bool,
-        }
-        impl ScalarUDFImpl for StatefulFunctionWithEqHashWithUdfEqualsHash {
-            fn as_any(&self) -> &dyn Any {
-                self
-            }
-            fn name(&self) -> &str {
-                "StatefulFunctionWithEqHashWithUdfEqualsHash"
-            }
-            fn signature(&self) -> &Signature {
-                &self.signature
-            }
-            fn return_type(&self, _arg_types: &[DataType]) -> Result<DataType> {
-                todo!()
-            }
-            fn invoke_with_args(
-                &self,
-                _args: ScalarFunctionArgs,
-            ) -> Result<ColumnarValue> {
-                todo!()
-            }
-            udf_equals_hash!(ScalarUDFImpl);
-        }
+        // Generate error message with only 1 argument provided
+        let error_msg =
+            generate_signature_error_message("substr", &sig, &[DataType::Utf8]);
 
-        let signature = Signature::exact(vec![DataType::Utf8], Volatility::Immutable);
+        assert!(
+            error_msg.contains("str: Utf8, start_pos: Int64"),
+            "Expected 'str: Utf8, start_pos: Int64' in error message, got: {error_msg}"
+        );
+        assert!(
+            error_msg.contains("str: Utf8, start_pos: Int64, length: Int64"),
+            "Expected 'str: Utf8, start_pos: Int64, length: Int64' in error message, got: {error_msg}"
+        );
+    }
 
-        // Sadly, without `udf_equals_hash!` macro, the equals and hash_value ignore state fields,
-        // even though the struct implements `PartialEq` and `Hash`.
-        let a: Box<dyn ScalarUDFImpl> = Box::new(StatefulFunctionWithEqHash {
-            signature: signature.clone(),
-            state: true,
-        });
-        let b: Box<dyn ScalarUDFImpl> = Box::new(StatefulFunctionWithEqHash {
-            signature: signature.clone(),
-            state: false,
-        });
-        assert!(a.equals(b.as_ref()));
-        assert_eq!(a.hash_value(), b.hash_value());
+    #[test]
+    fn test_generate_signature_error_msg_without_parameter_names() {
+        let sig = Signature::one_of(
+            vec![TypeSignature::Any(2), TypeSignature::Any(3)],
+            Volatility::Immutable,
+        );
 
-        // With udf_equals_hash! macro, the equals and hash_value compare the state.
-        // even though the struct implements `PartialEq` and `Hash`.
-        let a: Box<dyn ScalarUDFImpl> =
-            Box::new(StatefulFunctionWithEqHashWithUdfEqualsHash {
-                signature: signature.clone(),
-                state: true,
-            });
-        let b: Box<dyn ScalarUDFImpl> =
-            Box::new(StatefulFunctionWithEqHashWithUdfEqualsHash {
-                signature: signature.clone(),
-                state: false,
-            });
-        assert!(!a.equals(b.as_ref()));
-        // This could be true, but it's very unlikely that boolean true and false hash the same
-        assert_ne!(a.hash_value(), b.hash_value());
+        let error_msg =
+            generate_signature_error_message("my_func", &sig, &[DataType::Int32]);
+
+        assert!(
+            error_msg.contains("Any, Any"),
+            "Expected 'Any, Any' without parameter names, got: {error_msg}"
+        );
     }
 }

@@ -18,10 +18,12 @@
 use std::{collections::HashMap, sync::Arc};
 
 use super::{
-    utils::character_length_to_sql, utils::date_part_to_sql,
-    utils::sqlite_date_trunc_to_sql, utils::sqlite_from_unixtime_to_sql, Unparser,
+    Unparser, utils::character_length_to_sql, utils::date_part_to_sql,
+    utils::sqlite_date_trunc_to_sql, utils::sqlite_from_unixtime_to_sql,
 };
+use arrow::array::timezone::Tz;
 use arrow::datatypes::TimeUnit;
+use chrono::DateTime;
 use datafusion_common::Result;
 use datafusion_expr::Expr;
 use regex::Regex;
@@ -204,6 +206,48 @@ pub trait Dialect: Send + Sync {
     fn col_alias_overrides(&self, _alias: &str) -> Result<Option<String>> {
         Ok(None)
     }
+
+    /// Allows the dialect to support the QUALIFY clause
+    ///
+    /// Some dialects, like Postgres, do not support the QUALIFY clause
+    fn supports_qualify(&self) -> bool {
+        true
+    }
+
+    /// Allows the dialect to override logic of formatting datetime with tz into string.
+    fn timestamp_with_tz_to_string(&self, dt: DateTime<Tz>, _unit: TimeUnit) -> String {
+        dt.to_string()
+    }
+
+    /// Whether the dialect supports an empty select list such as `SELECT FROM table`.
+    ///
+    /// An empty select list returns rows without any column data, which is useful for:
+    /// - Counting rows: `SELECT FROM users WHERE active = true` (combined with `COUNT(*)`)
+    /// - Testing row existence without retrieving column data
+    /// - Performance optimization when only row counts or existence checks are needed
+    ///
+    /// # Default
+    ///
+    /// Returns `false` for maximum compatibility across SQL dialects. When `false`,
+    /// the unparser falls back to `SELECT 1 FROM table`.
+    ///
+    /// # Implementation Note
+    ///
+    /// Specific dialects should override this method to return `true` if they support
+    /// the empty select list syntax (e.g., PostgreSQL).
+    ///
+    /// # Example SQL Output
+    ///
+    /// ```sql
+    /// -- When supported:
+    /// SELECT FROM users WHERE active = true;
+    ///
+    /// -- Fallback when unsupported:
+    /// SELECT 1 FROM users WHERE active = true;
+    /// ```
+    fn supports_empty_select_list(&self) -> bool {
+        false
+    }
 }
 
 /// `IntervalStyle` to use for unparsing
@@ -254,19 +298,30 @@ impl Dialect for DefaultDialect {
         let id_upper = identifier.to_uppercase();
         // Special case ignore "ID", see https://github.com/sqlparser-rs/sqlparser-rs/issues/1382
         // ID is a keyword in ClickHouse, but we don't want to quote it when unparsing SQL here
-        if (id_upper != "ID" && ALL_KEYWORDS.contains(&id_upper.as_str()))
+        // Also quote identifiers with uppercase letters since unquoted identifiers are
+        // normalized to lowercase by the SQL parser, which would break case-sensitive schemas
+        let needs_quote = (id_upper != "ID" && ALL_KEYWORDS.contains(&id_upper.as_str()))
             || !identifier_regex.is_match(identifier)
-        {
-            Some('"')
-        } else {
-            None
-        }
+            || identifier.chars().any(|c| c.is_ascii_uppercase());
+        if needs_quote { Some('"') } else { None }
     }
 }
 
 pub struct PostgreSqlDialect {}
 
 impl Dialect for PostgreSqlDialect {
+    fn supports_qualify(&self) -> bool {
+        false
+    }
+
+    fn requires_derived_table_alias(&self) -> bool {
+        true
+    }
+
+    fn supports_empty_select_list(&self) -> bool {
+        true
+    }
+
     fn identifier_quote_style(&self, _: &str) -> Option<char> {
         Some('"')
     }
@@ -401,11 +456,26 @@ impl Dialect for DuckDBDialect {
 
         Ok(None)
     }
+
+    fn timestamp_with_tz_to_string(&self, dt: DateTime<Tz>, unit: TimeUnit) -> String {
+        let format = match unit {
+            TimeUnit::Second => "%Y-%m-%d %H:%M:%S%:z",
+            TimeUnit::Millisecond => "%Y-%m-%d %H:%M:%S%.3f%:z",
+            TimeUnit::Microsecond => "%Y-%m-%d %H:%M:%S%.6f%:z",
+            TimeUnit::Nanosecond => "%Y-%m-%d %H:%M:%S%.9f%:z",
+        };
+
+        dt.format(format).to_string()
+    }
 }
 
 pub struct MySqlDialect {}
 
 impl Dialect for MySqlDialect {
+    fn supports_qualify(&self) -> bool {
+        false
+    }
+
     fn identifier_quote_style(&self, _: &str) -> Option<char> {
         Some('`')
     }
@@ -467,6 +537,10 @@ impl Dialect for MySqlDialect {
 pub struct SqliteDialect {}
 
 impl Dialect for SqliteDialect {
+    fn supports_qualify(&self) -> bool {
+        false
+    }
+
     fn identifier_quote_style(&self, _: &str) -> Option<char> {
         Some('`')
     }
@@ -485,6 +559,14 @@ impl Dialect for SqliteDialect {
 
     fn supports_column_alias_in_table_alias(&self) -> bool {
         false
+    }
+
+    fn timestamp_cast_dtype(
+        &self,
+        _time_unit: &TimeUnit,
+        _tz: &Option<Arc<str>>,
+    ) -> ast::DataType {
+        ast::DataType::Text
     }
 
     fn scalar_function_to_sql_overrides(

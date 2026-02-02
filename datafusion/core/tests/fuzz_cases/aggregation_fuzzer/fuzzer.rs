@@ -19,9 +19,9 @@ use std::sync::Arc;
 
 use arrow::array::RecordBatch;
 use arrow::util::pretty::pretty_format_batches;
-use datafusion_common::{DataFusionError, Result};
+use datafusion_common::{Result, internal_datafusion_err};
 use datafusion_common_runtime::JoinSet;
-use rand::{rng, Rng};
+use rand::{Rng, rng};
 
 use crate::fuzz_cases::aggregation_fuzzer::query_builder::QueryBuilder;
 use crate::fuzz_cases::aggregation_fuzzer::{
@@ -197,7 +197,7 @@ impl AggregationFuzzer {
         while let Some(join_handle) = join_set.join_next().await {
             // propagate errors
             join_handle.map_err(|e| {
-                DataFusionError::Internal(format!("AggregationFuzzer task error: {e:?}"))
+                internal_datafusion_err!("AggregationFuzzer task error: {e:?}")
             })??;
         }
         Ok(())
@@ -253,7 +253,6 @@ impl AggregationFuzzer {
 ///
 ///   - `dataset_ref`, the input dataset, store it for error reported when found
 ///     the inconsistency between the one for `ctx` and `expected results`.
-///
 struct AggregationFuzzTestTask {
     /// Generated session context in current test case
     ctx_with_params: SessionContextWithParams,
@@ -308,7 +307,7 @@ impl AggregationFuzzTestTask {
                 format_batches_with_limit(expected_result),
                 format_batches_with_limit(&self.dataset_ref.batches),
             );
-            DataFusionError::Internal(message)
+            internal_datafusion_err!("{message}")
         })
     }
 

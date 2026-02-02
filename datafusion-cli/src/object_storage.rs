@@ -15,10 +15,12 @@
 // specific language governing permissions and limitations
 // under the License.
 
+pub mod instrumented;
+
 use async_trait::async_trait;
 use aws_config::BehaviorVersion;
 use aws_credential_types::provider::{
-    error::CredentialsError, ProvideCredentials, SharedCredentialsProvider,
+    ProvideCredentials, SharedCredentialsProvider, error::CredentialsError,
 };
 use datafusion::{
     common::{
@@ -31,12 +33,12 @@ use datafusion::{
 };
 use log::debug;
 use object_store::{
-    aws::{AmazonS3Builder, AmazonS3ConfigKey, AwsCredential},
-    gcp::GoogleCloudStorageBuilder,
-    http::HttpBuilder,
     ClientOptions, CredentialProvider,
     Error::Generic,
     ObjectStore,
+    aws::{AmazonS3Builder, AmazonS3ConfigKey, AwsCredential},
+    gcp::GoogleCloudStorageBuilder,
+    http::HttpBuilder,
 };
 use std::{
     any::Any,
@@ -122,14 +124,15 @@ pub async fn get_s3_object_store_builder(
     if let Some(endpoint) = endpoint {
         // Make a nicer error if the user hasn't allowed http and the endpoint
         // is http as the default message is "URL scheme is not allowed"
-        if let Ok(endpoint_url) = Url::try_from(endpoint.as_str()) {
-            if !matches!(allow_http, Some(true)) && endpoint_url.scheme() == "http" {
-                return config_err!(
-                    "Invalid endpoint: {endpoint}. \
+        if let Ok(endpoint_url) = Url::try_from(endpoint.as_str())
+            && !matches!(allow_http, Some(true))
+            && endpoint_url.scheme() == "http"
+        {
+            return config_err!(
+                "Invalid endpoint: {endpoint}. \
                 HTTP is not allowed for S3 endpoints. \
                 To allow HTTP, set 'aws.allow_http' to true"
-                );
-            }
+            );
         }
 
         builder = builder.with_endpoint(endpoint);
@@ -295,10 +298,7 @@ pub fn get_gcs_object_store_builder(
 
 fn get_bucket_name(url: &Url) -> Result<&str> {
     url.host_str().ok_or_else(|| {
-        DataFusionError::Execution(format!(
-            "Not able to parse bucket name from url: {}",
-            url.as_str()
-        ))
+        exec_datafusion_err!("Not able to parse bucket name from url: {}", url.as_str())
     })
 }
 
@@ -579,10 +579,18 @@ mod tests {
 
     #[tokio::test]
     async fn s3_object_store_builder_default() -> Result<()> {
+        if let Err(DataFusionError::Execution(e)) = check_aws_envs().await {
+            // Skip test if AWS envs are not set
+            eprintln!("{e}");
+            return Ok(());
+        }
+
         let location = "s3://bucket/path/FAKE/file.parquet";
         // Set it to a non-existent file to avoid reading the default configuration file
-        std::env::set_var("AWS_CONFIG_FILE", "data/aws.config");
-        std::env::set_var("AWS_SHARED_CREDENTIALS_FILE", "data/aws.credentials");
+        unsafe {
+            std::env::set_var("AWS_CONFIG_FILE", "data/aws.config");
+            std::env::set_var("AWS_SHARED_CREDENTIALS_FILE", "data/aws.credentials");
+        }
 
         // No options
         let table_url = ListingTableUrl::parse(location)?;
@@ -711,7 +719,10 @@ mod tests {
             .await
             .unwrap_err();
 
-        assert_eq!(err.to_string().lines().next().unwrap_or_default(), "Invalid or Unsupported Configuration: Invalid endpoint: http://endpoint33. HTTP is not allowed for S3 endpoints. To allow HTTP, set 'aws.allow_http' to true");
+        assert_eq!(
+            err.to_string().lines().next().unwrap_or_default(),
+            "Invalid or Unsupported Configuration: Invalid endpoint: http://endpoint33. HTTP is not allowed for S3 endpoints. To allow HTTP, set 'aws.allow_http' to true"
+        );
 
         // Now add `allow_http` to the options and check if it works
         let sql = format!(
@@ -733,10 +744,17 @@ mod tests {
 
     #[tokio::test]
     async fn s3_object_store_builder_resolves_region_when_none_provided() -> Result<()> {
+        if let Err(DataFusionError::Execution(e)) = check_aws_envs().await {
+            // Skip test if AWS envs are not set
+            eprintln!("{e}");
+            return Ok(());
+        }
         let expected_region = "eu-central-1";
         let location = "s3://test-bucket/path/file.parquet";
         // Set it to a non-existent file to avoid reading the default configuration file
-        std::env::set_var("AWS_CONFIG_FILE", "data/aws.config");
+        unsafe {
+            std::env::set_var("AWS_CONFIG_FILE", "data/aws.config");
+        }
 
         let table_url = ListingTableUrl::parse(location)?;
         let aws_options = AwsOptions {
@@ -757,8 +775,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn s3_object_store_builder_overrides_region_when_resolve_region_enabled(
-    ) -> Result<()> {
+    async fn s3_object_store_builder_overrides_region_when_resolve_region_enabled()
+    -> Result<()> {
+        if let Err(DataFusionError::Execution(e)) = check_aws_envs().await {
+            // Skip test if AWS envs are not set
+            eprintln!("{e}");
+            return Ok(());
+        }
+
         let original_region = "us-east-1";
         let expected_region = "eu-central-1"; // This should be the auto-detected region
         let location = "s3://test-bucket/path/file.parquet";
@@ -790,7 +814,9 @@ mod tests {
 
         let table_url = ListingTableUrl::parse(location)?;
         let scheme = table_url.scheme();
-        let sql = format!("CREATE EXTERNAL TABLE test STORED AS PARQUET OPTIONS('aws.access_key_id' '{access_key_id}', 'aws.secret_access_key' '{secret_access_key}', 'aws.oss.endpoint' '{endpoint}') LOCATION '{location}'");
+        let sql = format!(
+            "CREATE EXTERNAL TABLE test STORED AS PARQUET OPTIONS('aws.access_key_id' '{access_key_id}', 'aws.secret_access_key' '{secret_access_key}', 'aws.oss.endpoint' '{endpoint}') LOCATION '{location}'"
+        );
 
         let ctx = SessionContext::new();
         ctx.register_table_options_extension_from_scheme(scheme);
@@ -814,14 +840,15 @@ mod tests {
     #[tokio::test]
     async fn gcs_object_store_builder() -> Result<()> {
         let service_account_path = "fake_service_account_path";
-        let service_account_key =
-            "{\"private_key\": \"fake_private_key.pem\",\"client_email\":\"fake_client_email\"}";
+        let service_account_key = "{\"private_key\": \"fake_private_key.pem\",\"client_email\":\"fake_client_email\"}";
         let application_credentials_path = "fake_application_credentials_path";
         let location = "gcs://bucket/path/file.parquet";
 
         let table_url = ListingTableUrl::parse(location)?;
         let scheme = table_url.scheme();
-        let sql = format!("CREATE EXTERNAL TABLE test STORED AS PARQUET OPTIONS('gcp.service_account_path' '{service_account_path}', 'gcp.service_account_key' '{service_account_key}', 'gcp.application_credentials_path' '{application_credentials_path}') LOCATION '{location}'");
+        let sql = format!(
+            "CREATE EXTERNAL TABLE test STORED AS PARQUET OPTIONS('gcp.service_account_path' '{service_account_path}', 'gcp.service_account_key' '{service_account_key}', 'gcp.application_credentials_path' '{application_credentials_path}') LOCATION '{location}'"
+        );
 
         let ctx = SessionContext::new();
         ctx.register_table_options_extension_from_scheme(scheme);
@@ -859,5 +886,20 @@ mod tests {
             .alter_with_string_hash_map(&cmd.options)
             .unwrap();
         table_options
+    }
+
+    async fn check_aws_envs() -> Result<()> {
+        let aws_envs = [
+            "AWS_ACCESS_KEY_ID",
+            "AWS_SECRET_ACCESS_KEY",
+            "AWS_REGION",
+            "AWS_ALLOW_HTTP",
+        ];
+        for aws_env in aws_envs {
+            std::env::var(aws_env).map_err(|_| {
+                exec_datafusion_err!("aws envs not set, skipping s3 tests")
+            })?;
+        }
+        Ok(())
     }
 }

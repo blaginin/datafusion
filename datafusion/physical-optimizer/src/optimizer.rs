@@ -21,7 +21,6 @@ use std::fmt::Debug;
 use std::sync::Arc;
 
 use crate::aggregate_statistics::AggregateStatistics;
-use crate::coalesce_batches::CoalesceBatches;
 use crate::combine_partial_final_agg::CombinePartialFinalAggregate;
 use crate::enforce_distribution::EnforceDistribution;
 use crate::enforce_sorting::EnforceSorting;
@@ -36,9 +35,10 @@ use crate::sanity_checker::SanityCheckPlan;
 use crate::topk_aggregation::TopKAggregation;
 use crate::update_aggr_exprs::OptimizeAggregateOrder;
 
-use crate::coalesce_async_exec_input::CoalesceAsyncExecInput;
-use datafusion_common::config::ConfigOptions;
+use crate::limit_pushdown_past_window::LimitPushPastWindows;
+use crate::pushdown_sort::PushdownSort;
 use datafusion_common::Result;
+use datafusion_common::config::ConfigOptions;
 use datafusion_physical_plan::ExecutionPlan;
 
 /// `PhysicalOptimizerRule` transforms one ['ExecutionPlan'] into another which
@@ -59,7 +59,7 @@ pub trait PhysicalOptimizerRule: Debug {
     /// A human readable name for this optimizer rule
     fn name(&self) -> &str;
 
-    /// A flag to indicate whether the physical planner should valid the rule will not
+    /// A flag to indicate whether the physical planner should validate that the rule will not
     /// change the schema of the plan after the rewriting.
     /// Some of the optimization rules might change the nullable properties of the schema
     /// and should disable the schema check.
@@ -119,10 +119,6 @@ impl PhysicalOptimizer {
             Arc::new(OptimizeAggregateOrder::new()),
             // TODO: `try_embed_to_hash_join` in the ProjectionPushdown rule would be block by the CoalesceBatches, so add it before CoalesceBatches. Maybe optimize it in the future.
             Arc::new(ProjectionPushdown::new()),
-            // The CoalesceBatches rule will not influence the distribution and ordering of the
-            // whole plan tree. Therefore, to avoid influencing other rules, it should run last.
-            Arc::new(CoalesceBatches::new()),
-            Arc::new(CoalesceAsyncExecInput::new()),
             // Remove the ancillary output requirement operator since we are done with the planning
             // phase.
             Arc::new(OutputRequirements::new_remove_mode()),
@@ -131,6 +127,10 @@ impl PhysicalOptimizer {
             // into an `order by max(x) limit y`. In this case it will copy the limit value down
             // to the aggregation, allowing it to use only y number of accumulators.
             Arc::new(TopKAggregation::new()),
+            // Tries to push limits down through window functions, growing as appropriate
+            // This can possibly be combined with [LimitPushdown]
+            // It needs to come after [EnforceSorting]
+            Arc::new(LimitPushPastWindows::new()),
             // The LimitPushdown rule tries to push limits down as far as possible,
             // replacing operators with fetching variants, or adding limits
             // past operators that support limit pushdown.
@@ -142,6 +142,8 @@ impl PhysicalOptimizer {
             // are not present, the load of executors such as join or union will be
             // reduced by narrowing their input tables.
             Arc::new(ProjectionPushdown::new()),
+            // PushdownSort: Detect sorts that can be pushed down to data sources.
+            Arc::new(PushdownSort::new()),
             Arc::new(EnsureCooperative::new()),
             // This FilterPushdown handles dynamic filters that may have references to the source ExecutionPlan.
             // Therefore it should be run at the end of the optimization process since any changes to the plan may break the dynamic filter's references.

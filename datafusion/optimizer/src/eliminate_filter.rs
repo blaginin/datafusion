@@ -34,7 +34,7 @@ use crate::{OptimizerConfig, OptimizerRule};
 pub struct EliminateFilter;
 
 impl EliminateFilter {
-    #[allow(missing_docs)]
+    #[expect(missing_docs)]
     pub fn new() -> Self {
         Self {}
     }
@@ -81,10 +81,10 @@ impl OptimizerRule for EliminateFilter {
 mod tests {
     use std::sync::Arc;
 
-    use crate::assert_optimized_plan_eq_snapshot;
     use crate::OptimizerContext;
+    use crate::assert_optimized_plan_eq_snapshot;
     use datafusion_common::{Result, ScalarValue};
-    use datafusion_expr::{col, lit, logical_plan::builder::LogicalPlanBuilder, Expr};
+    use datafusion_expr::{Expr, col, lit, logical_plan::builder::LogicalPlanBuilder};
 
     use crate::eliminate_filter::EliminateFilter;
     use crate::test::*;
@@ -117,7 +117,7 @@ mod tests {
             .build()?;
 
         // No aggregate / scan / limit
-        assert_optimized_plan_equal!(plan, @"EmptyRelation")
+        assert_optimized_plan_equal!(plan, @"EmptyRelation: rows=0")
     }
 
     #[test]
@@ -131,7 +131,7 @@ mod tests {
             .build()?;
 
         // No aggregate / scan / limit
-        assert_optimized_plan_equal!(plan, @"EmptyRelation")
+        assert_optimized_plan_equal!(plan, @"EmptyRelation: rows=0")
     }
 
     #[test]
@@ -151,7 +151,7 @@ mod tests {
         // Left side is removed
         assert_optimized_plan_equal!(plan, @r"
         Union
-          EmptyRelation
+          EmptyRelation: rows=0
           Aggregate: groupBy=[[test.a]], aggr=[[sum(test.b)]]
             TableScan: test
         ")
@@ -217,7 +217,7 @@ mod tests {
         // Filter is removed
         assert_optimized_plan_equal!(plan, @r"
         Projection: test.a
-          EmptyRelation
+          EmptyRelation: rows=0
         ")
     }
 }

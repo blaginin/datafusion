@@ -25,25 +25,27 @@ use sqlparser::ast::{
 use std::sync::Arc;
 use std::vec;
 
-use super::dialect::IntervalStyle;
 use super::Unparser;
+use super::dialect::IntervalStyle;
 use arrow::array::{
+    ArrayRef, Date32Array, Date64Array, PrimitiveArray,
     types::{
         ArrowTemporalType, Time32MillisecondType, Time32SecondType,
         Time64MicrosecondType, Time64NanosecondType, TimestampMicrosecondType,
         TimestampMillisecondType, TimestampNanosecondType, TimestampSecondType,
     },
-    ArrayRef, Date32Array, Date64Array, PrimitiveArray,
 };
-use arrow::datatypes::{DataType, Decimal128Type, Decimal256Type, DecimalType};
+use arrow::datatypes::{
+    DataType, Decimal32Type, Decimal64Type, Decimal128Type, Decimal256Type, DecimalType,
+};
 use arrow::util::display::array_value_to_string;
 use datafusion_common::{
-    internal_datafusion_err, internal_err, not_impl_err, plan_err, Column, Result,
-    ScalarValue,
+    Column, Result, ScalarValue, assert_eq_or_internal_err, assert_or_internal_err,
+    internal_datafusion_err, internal_err, not_impl_err, plan_err,
 };
 use datafusion_expr::{
-    expr::{Alias, Exists, InList, ScalarFunction, Sort, WindowFunction},
     Between, BinaryExpr, Case, Cast, Expr, GroupingSet, Like, Operator, TryCast,
+    expr::{Alias, Exists, InList, ScalarFunction, SetQuantifier, Sort, WindowFunction},
 };
 use sqlparser::ast::helpers::attached_token::AttachedToken;
 use sqlparser::tokenizer::Span;
@@ -68,9 +70,8 @@ use sqlparser::tokenizer::Span;
 /// use datafusion_expr::{col, lit};
 /// use datafusion_sql::unparser::expr_to_sql;
 /// let expr = col("a").gt(lit(4)); // form an expression `a > 4`
-/// let sql = expr_to_sql(&expr).unwrap(); // convert to ast::Expr
-/// // use the Display impl to convert to SQL text
-/// assert_eq!(sql.to_string(), "(a > 4)")
+/// let sql = expr_to_sql(&expr).unwrap(); // convert to ast::Expr, using
+/// assert_eq!(sql.to_string(), "(a > 4)"); // use Display impl for SQL text
 /// ```
 ///
 /// [`SqlToRel::sql_to_expr`]: crate::planner::SqlToRel::sql_to_expr
@@ -183,6 +184,8 @@ impl Unparser<'_> {
                     operand,
                     conditions,
                     else_result,
+                    case_token: AttachedToken::empty(),
+                    end_token: AttachedToken::empty(),
                 })
             }
             Expr::Cast(Cast { expr, data_type }) => {
@@ -199,6 +202,7 @@ impl Unparser<'_> {
                             partition_by,
                             order_by,
                             window_frame,
+                            filter,
                             distinct,
                             ..
                         },
@@ -263,7 +267,10 @@ impl Unparser<'_> {
                         args,
                         clauses: vec![],
                     }),
-                    filter: None,
+                    filter: filter
+                        .as_ref()
+                        .map(|f| self.expr_to_sql_inner(f).map(Box::new))
+                        .transpose()?,
                     null_treatment: None,
                     over,
                     within_group: vec![],
@@ -281,7 +288,7 @@ impl Unparser<'_> {
                 negated: *negated,
                 expr: Box::new(self.expr_to_sql_inner(expr)?),
                 pattern: Box::new(self.expr_to_sql_inner(pattern)?),
-                escape_char: escape_char.map(|c| c.to_string()),
+                escape_char: escape_char.map(|c| SingleQuotedString(c.to_string())),
                 any: false,
             }),
             Expr::Like(Like {
@@ -296,7 +303,8 @@ impl Unparser<'_> {
                         negated: *negated,
                         expr: Box::new(self.expr_to_sql_inner(expr)?),
                         pattern: Box::new(self.expr_to_sql_inner(pattern)?),
-                        escape_char: escape_char.map(|c| c.to_string()),
+                        escape_char: escape_char
+                            .map(|c| SingleQuotedString(c.to_string())),
                         any: false,
                     })
                 } else {
@@ -304,7 +312,8 @@ impl Unparser<'_> {
                         negated: *negated,
                         expr: Box::new(self.expr_to_sql_inner(expr)?),
                         pattern: Box::new(self.expr_to_sql_inner(pattern)?),
-                        escape_char: escape_char.map(|c| c.to_string()),
+                        escape_char: escape_char
+                            .map(|c| SingleQuotedString(c.to_string())),
                         any: false,
                     })
                 }
@@ -326,7 +335,7 @@ impl Unparser<'_> {
                     None => None,
                 };
                 let within_group: Vec<ast::OrderByExpr> =
-                    if agg.func.is_ordered_set_aggregate() {
+                    if agg.func.supports_within_group_clause() {
                         order_by
                             .iter()
                             .map(|sort_expr| self.sort_to_sql(sort_expr))
@@ -384,6 +393,33 @@ impl Unparser<'_> {
                     negated: insubq.negated,
                 })
             }
+            Expr::SetComparison(set_cmp) => {
+                let left = Box::new(self.expr_to_sql_inner(set_cmp.expr.as_ref())?);
+                let sub_statement =
+                    self.plan_to_sql(set_cmp.subquery.subquery.as_ref())?;
+                let sub_query = if let ast::Statement::Query(inner_query) = sub_statement
+                {
+                    inner_query
+                } else {
+                    return plan_err!(
+                        "Subquery must be a Query, but found {sub_statement:?}"
+                    );
+                };
+                let compare_op = self.op_to_sql(&set_cmp.op)?;
+                match set_cmp.quantifier {
+                    SetQuantifier::Any => Ok(ast::Expr::AnyOp {
+                        left,
+                        compare_op,
+                        right: Box::new(ast::Expr::Subquery(sub_query)),
+                        is_some: false,
+                    }),
+                    SetQuantifier::All => Ok(ast::Expr::AllOp {
+                        left,
+                        compare_op,
+                        right: Box::new(ast::Expr::Subquery(sub_query)),
+                    }),
+                }
+            }
             Expr::Exists(Exists { subquery, negated }) => {
                 let sub_statement = self.plan_to_sql(subquery.subquery.as_ref())?;
                 let sub_query = if let ast::Statement::Query(inner_query) = sub_statement
@@ -438,9 +474,7 @@ impl Unparser<'_> {
                 })
             }
             Expr::ScalarVariable(_, ids) => {
-                if ids.is_empty() {
-                    return internal_err!("Not a valid ScalarVariable");
-                }
+                assert_or_internal_err!(!ids.is_empty(), "Not a valid ScalarVariable");
 
                 Ok(if ids.len() == 1 {
                     ast::Expr::Identifier(
@@ -584,9 +618,11 @@ impl Unparser<'_> {
     }
 
     fn array_element_to_sql(&self, args: &[Expr]) -> Result<ast::Expr> {
-        if args.len() != 2 {
-            return internal_err!("array_element must have exactly 2 arguments");
-        }
+        assert_eq_or_internal_err!(
+            args.len(),
+            2,
+            "array_element must have exactly 2 arguments"
+        );
         let array = self.expr_to_sql(&args[0])?;
         let index = self.expr_to_sql(&args[1])?;
         Ok(ast::Expr::CompoundFieldAccess {
@@ -596,9 +632,10 @@ impl Unparser<'_> {
     }
 
     fn named_struct_to_sql(&self, args: &[Expr]) -> Result<ast::Expr> {
-        if args.len() % 2 != 0 {
-            return internal_err!("named_struct must have an even number of arguments");
-        }
+        assert_or_internal_err!(
+            args.len().is_multiple_of(2),
+            "named_struct must have an even number of arguments"
+        );
 
         let args = args
             .chunks_exact(2)
@@ -619,38 +656,53 @@ impl Unparser<'_> {
     }
 
     fn get_field_to_sql(&self, args: &[Expr]) -> Result<ast::Expr> {
-        if args.len() != 2 {
-            return internal_err!("get_field must have exactly 2 arguments");
+        if args.len() < 2 {
+            return internal_err!(
+                "get_field must have at least 2 arguments, got {}",
+                args.len()
+            );
         }
 
-        let field = match &args[1] {
-            Expr::Literal(lit, _) => self.new_ident_quoted_if_needs(lit.to_string()),
-            _ => {
-                return internal_err!(
-                "get_field expects second argument to be a string, but received: {:?}",
-                &args[1]
-            )
-            }
-        };
+        // Extract all field names (args[1..])
+        let mut fields = Vec::with_capacity(args.len() - 1);
+        for arg in &args[1..] {
+            let field = match arg {
+                Expr::Literal(lit, _) => self.new_ident_quoted_if_needs(lit.to_string()),
+                _ => {
+                    return internal_err!(
+                        "get_field expects field arguments to be strings, but received: {:?}",
+                        arg
+                    );
+                }
+            };
+            fields.push(field);
+        }
 
         match &args[0] {
             Expr::Column(col) => {
                 let mut id = match self.col_to_sql(col)? {
                     ast::Expr::Identifier(ident) => vec![ident],
                     ast::Expr::CompoundIdentifier(idents) => idents,
-                    other => return internal_err!("expected col_to_sql to return an Identifier or CompoundIdentifier, but received: {:?}", other),
+                    other => {
+                        return internal_err!(
+                            "expected col_to_sql to return an Identifier or CompoundIdentifier, but received: {:?}",
+                            other
+                        );
+                    }
                 };
-                id.push(field);
+                id.extend(fields);
                 Ok(ast::Expr::CompoundIdentifier(id))
             }
             Expr::ScalarFunction(struct_expr) => {
                 let root = self
                     .scalar_function_to_sql(struct_expr.func.name(), &struct_expr.args)?;
+                let access_chain = fields
+                    .into_iter()
+                    .map(|field| ast::AccessExpr::Dot(ast::Expr::Identifier(field)))
+                    .collect();
                 Ok(ast::Expr::CompoundFieldAccess {
                     root: Box::new(root),
-                    access_chain: vec![ast::AccessExpr::Dot(ast::Expr::Identifier(
-                        field,
-                    ))],
+                    access_chain,
                 })
             }
             _ => {
@@ -663,9 +715,7 @@ impl Unparser<'_> {
     }
 
     fn map_to_sql(&self, args: &[Expr]) -> Result<ast::Expr> {
-        if args.len() != 2 {
-            return internal_err!("map must have exactly 2 arguments");
-        }
+        assert_eq_or_internal_err!(args.len(), 2, "map must have exactly 2 arguments");
 
         let ast::Expr::Array(Array { elem: keys, .. }) = self.expr_to_sql(&args[0])?
         else {
@@ -1054,8 +1104,19 @@ impl Unparser<'_> {
     where
         i64: From<T::Native>,
     {
+        let time_unit = match T::DATA_TYPE {
+            DataType::Timestamp(unit, _) => unit,
+            _ => {
+                return Err(internal_datafusion_err!(
+                    "Expected Timestamp, got {:?}",
+                    T::DATA_TYPE
+                ));
+            }
+        };
+
         let ts = if let Some(tz) = tz {
-            v.to_array()?
+            let dt = v
+                .to_array()?
                 .as_any()
                 .downcast_ref::<PrimitiveArray<T>>()
                 .ok_or(internal_datafusion_err!(
@@ -1064,8 +1125,8 @@ impl Unparser<'_> {
                 .value_as_datetime_with_tz(0, tz.parse()?)
                 .ok_or(internal_datafusion_err!(
                     "Unable to convert {v:?} to DateTime"
-                ))?
-                .to_string()
+                ))?;
+            self.dialect.timestamp_with_tz_to_string(dt, time_unit)
         } else {
             v.to_array()?
                 .as_any()
@@ -1078,16 +1139,6 @@ impl Unparser<'_> {
                     "Unable to convert {v:?} to DateTime"
                 ))?
                 .to_string()
-        };
-
-        let time_unit = match T::DATA_TYPE {
-            DataType::Timestamp(unit, _) => unit,
-            _ => {
-                return Err(internal_datafusion_err!(
-                    "Expected Timestamp, got {:?}",
-                    T::DATA_TYPE
-                ))
-            }
         };
 
         Ok(ast::Expr::Cast {
@@ -1174,6 +1225,20 @@ impl Unparser<'_> {
                 Ok(ast::Expr::value(ast::Value::Number(f_val, false)))
             }
             ScalarValue::Float64(None) => Ok(ast::Expr::value(ast::Value::Null)),
+            ScalarValue::Decimal32(Some(value), precision, scale) => {
+                Ok(ast::Expr::value(ast::Value::Number(
+                    Decimal32Type::format_decimal(*value, *precision, *scale),
+                    false,
+                )))
+            }
+            ScalarValue::Decimal32(None, ..) => Ok(ast::Expr::value(ast::Value::Null)),
+            ScalarValue::Decimal64(Some(value), precision, scale) => {
+                Ok(ast::Expr::value(ast::Value::Number(
+                    Decimal64Type::format_decimal(*value, *precision, *scale),
+                    false,
+                )))
+            }
+            ScalarValue::Decimal64(None, ..) => Ok(ast::Expr::value(ast::Value::Null)),
             ScalarValue::Decimal128(Some(value), precision, scale) => {
                 Ok(ast::Expr::value(ast::Value::Number(
                     Decimal128Type::format_decimal(*value, *precision, *scale),
@@ -1405,7 +1470,9 @@ impl Unparser<'_> {
             };
             return Ok(ast::Expr::Interval(interval));
         } else if months != 0 {
-            return not_impl_err!("Unsupported Interval scalar with both Month and DayTime for IntervalStyle::MySQL");
+            return not_impl_err!(
+                "Unsupported Interval scalar with both Month and DayTime for IntervalStyle::MySQL"
+            );
         }
 
         // DAY only
@@ -1593,7 +1660,9 @@ impl Unparser<'_> {
                         };
                         Ok(ast::Expr::Interval(interval))
                     } else {
-                        not_impl_err!("Unsupported IntervalMonthDayNano scalar with both Month and DayTime for IntervalStyle::SQLStandard")
+                        not_impl_err!(
+                            "Unsupported IntervalMonthDayNano scalar with both Month and DayTime for IntervalStyle::SQLStandard"
+                        )
                     }
                 }
                 _ => not_impl_err!(
@@ -1650,7 +1719,7 @@ impl Unparser<'_> {
     fn arrow_dtype_to_ast_dtype(&self, data_type: &DataType) -> Result<ast::DataType> {
         match data_type {
             DataType::Null => {
-                not_impl_err!("Unsupported DataType: conversion: {data_type:?}")
+                not_impl_err!("Unsupported DataType: conversion: {data_type}")
             }
             DataType::Boolean => Ok(ast::DataType::Bool),
             DataType::Int8 => Ok(ast::DataType::TinyInt(None)),
@@ -1662,9 +1731,9 @@ impl Unparser<'_> {
             DataType::UInt32 => Ok(ast::DataType::IntegerUnsigned(None)),
             DataType::UInt64 => Ok(ast::DataType::BigIntUnsigned(None)),
             DataType::Float16 => {
-                not_impl_err!("Unsupported DataType: conversion: {data_type:?}")
+                not_impl_err!("Unsupported DataType: conversion: {data_type}")
             }
-            DataType::Float32 => Ok(ast::DataType::Float(None)),
+            DataType::Float32 => Ok(ast::DataType::Float(ast::ExactNumberInfo::None)),
             DataType::Float64 => Ok(self.dialect.float64_ast_dtype()),
             DataType::Timestamp(time_unit, tz) => {
                 Ok(self.dialect.timestamp_cast_dtype(time_unit, tz))
@@ -1672,59 +1741,58 @@ impl Unparser<'_> {
             DataType::Date32 => Ok(self.dialect.date32_cast_dtype()),
             DataType::Date64 => Ok(self.ast_type_for_date64_in_cast()),
             DataType::Time32(_) => {
-                not_impl_err!("Unsupported DataType: conversion: {data_type:?}")
+                not_impl_err!("Unsupported DataType: conversion: {data_type}")
             }
             DataType::Time64(_) => {
-                not_impl_err!("Unsupported DataType: conversion: {data_type:?}")
+                not_impl_err!("Unsupported DataType: conversion: {data_type}")
             }
             DataType::Duration(_) => {
-                not_impl_err!("Unsupported DataType: conversion: {data_type:?}")
+                not_impl_err!("Unsupported DataType: conversion: {data_type}")
             }
-            DataType::Interval(_) => Ok(ast::DataType::Interval),
+            DataType::Interval(_) => Ok(ast::DataType::Interval {
+                fields: None,
+                precision: None,
+            }),
             DataType::Binary => {
-                not_impl_err!("Unsupported DataType: conversion: {data_type:?}")
+                not_impl_err!("Unsupported DataType: conversion: {data_type}")
             }
             DataType::FixedSizeBinary(_) => {
-                not_impl_err!("Unsupported DataType: conversion: {data_type:?}")
+                not_impl_err!("Unsupported DataType: conversion: {data_type}")
             }
             DataType::LargeBinary => {
-                not_impl_err!("Unsupported DataType: conversion: {data_type:?}")
+                not_impl_err!("Unsupported DataType: conversion: {data_type}")
             }
             DataType::BinaryView => {
-                not_impl_err!("Unsupported DataType: conversion: {data_type:?}")
+                not_impl_err!("Unsupported DataType: conversion: {data_type}")
             }
             DataType::Utf8 => Ok(self.dialect.utf8_cast_dtype()),
             DataType::LargeUtf8 => Ok(self.dialect.large_utf8_cast_dtype()),
             DataType::Utf8View => Ok(self.dialect.utf8_cast_dtype()),
             DataType::List(_) => {
-                not_impl_err!("Unsupported DataType: conversion: {data_type:?}")
+                not_impl_err!("Unsupported DataType: conversion: {data_type}")
             }
             DataType::FixedSizeList(_, _) => {
-                not_impl_err!("Unsupported DataType: conversion: {data_type:?}")
+                not_impl_err!("Unsupported DataType: conversion: {data_type}")
             }
             DataType::LargeList(_) => {
-                not_impl_err!("Unsupported DataType: conversion: {data_type:?}")
+                not_impl_err!("Unsupported DataType: conversion: {data_type}")
             }
             DataType::ListView(_) => {
-                not_impl_err!("Unsupported DataType: conversion: {data_type:?}")
+                not_impl_err!("Unsupported DataType: conversion: {data_type}")
             }
             DataType::LargeListView(_) => {
-                not_impl_err!("Unsupported DataType: conversion: {data_type:?}")
+                not_impl_err!("Unsupported DataType: conversion: {data_type}")
             }
             DataType::Struct(_) => {
-                not_impl_err!("Unsupported DataType: conversion: {data_type:?}")
+                not_impl_err!("Unsupported DataType: conversion: {data_type}")
             }
             DataType::Union(_, _) => {
-                not_impl_err!("Unsupported DataType: conversion: {data_type:?}")
+                not_impl_err!("Unsupported DataType: conversion: {data_type}")
             }
             DataType::Dictionary(_, val) => self.arrow_dtype_to_ast_dtype(val),
-            DataType::Decimal32(_precision, _scale) => {
-                not_impl_err!("Unsupported DataType: conversion: {data_type:?}")
-            }
-            DataType::Decimal64(_precision, _scale) => {
-                not_impl_err!("Unsupported DataType: conversion: {data_type:?}")
-            }
-            DataType::Decimal128(precision, scale)
+            DataType::Decimal32(precision, scale)
+            | DataType::Decimal64(precision, scale)
+            | DataType::Decimal128(precision, scale)
             | DataType::Decimal256(precision, scale) => {
                 let mut new_precision = *precision as u64;
                 let mut new_scale = *scale as u64;
@@ -1734,14 +1802,17 @@ impl Unparser<'_> {
                 }
 
                 Ok(ast::DataType::Decimal(
-                    ast::ExactNumberInfo::PrecisionAndScale(new_precision, new_scale),
+                    ast::ExactNumberInfo::PrecisionAndScale(
+                        new_precision,
+                        new_scale as i64,
+                    ),
                 ))
             }
             DataType::Map(_, _) => {
-                not_impl_err!("Unsupported DataType: conversion: {data_type:?}")
+                not_impl_err!("Unsupported DataType: conversion: {data_type}")
             }
             DataType::RunEndEncoded(_, _) => {
-                not_impl_err!("Unsupported DataType: conversion: {data_type:?}")
+                not_impl_err!("Unsupported DataType: conversion: {data_type}")
             }
         }
     }
@@ -1756,15 +1827,16 @@ mod tests {
     use arrow::array::{LargeListArray, ListArray};
     use arrow::datatypes::{DataType::Int8, Field, Int32Type, Schema, TimeUnit};
     use ast::ObjectName;
+    use datafusion_common::datatype::DataTypeExt;
     use datafusion_common::{Spans, TableReference};
     use datafusion_expr::expr::WildcardOptions;
     use datafusion_expr::{
-        case, cast, col, cube, exists, grouping_set, interval_datetime_lit,
-        interval_year_month_lit, lit, not, not_exists, out_ref_col, placeholder, rollup,
-        table_scan, try_cast, when, ColumnarValue, ScalarFunctionArgs, ScalarUDF,
-        ScalarUDFImpl, Signature, Volatility, WindowFrame, WindowFunctionDefinition,
+        ColumnarValue, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature,
+        Volatility, WindowFrame, WindowFunctionDefinition, case, cast, col, cube, exists,
+        grouping_set, interval_datetime_lit, interval_year_month_lit, lit, not,
+        not_exists, out_ref_col, placeholder, rollup, table_scan, try_cast, when,
     };
-    use datafusion_expr::{interval_month_day_nano_lit, ExprFunctionExt};
+    use datafusion_expr::{ExprFunctionExt, interval_month_day_nano_lit};
     use datafusion_functions::datetime::from_unixtime::FromUnixtimeFunc;
     use datafusion_functions::expr_fn::{get_field, named_struct};
     use datafusion_functions_aggregate::count::count_udaf;
@@ -1783,7 +1855,7 @@ mod tests {
     use super::*;
 
     /// Mocked UDF
-    #[derive(Debug)]
+    #[derive(Debug, PartialEq, Eq, Hash)]
     struct DummyUDF {
         signature: Signature,
     }
@@ -2061,6 +2133,7 @@ mod tests {
                         window_frame: WindowFrame::new(None),
                         null_treatment: None,
                         distinct: false,
+                        filter: None,
                     },
                 }),
                 r#"row_number(col) OVER (ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING)"#,
@@ -2087,9 +2160,10 @@ mod tests {
                         ),
                         null_treatment: None,
                         distinct: false,
+                        filter: Some(Box::new(col("a").gt(lit(100)))),
                     },
                 }),
-                r#"count(*) OVER (ORDER BY a DESC NULLS FIRST RANGE BETWEEN 6 PRECEDING AND 2 FOLLOWING)"#,
+                r#"count(*) FILTER (WHERE (a > 100)) OVER (ORDER BY a DESC NULLS FIRST RANGE BETWEEN 6 PRECEDING AND 2 FOLLOWING)"#,
             ),
             (col("a").is_not_null(), r#"a IS NOT NULL"#),
             (col("a").is_null(), r#"a IS NULL"#),
@@ -2140,12 +2214,15 @@ mod tests {
                 r#"TRY_CAST(a AS INTEGER UNSIGNED)"#,
             ),
             (
-                Expr::ScalarVariable(Int8, vec![String::from("@a")]),
+                Expr::ScalarVariable(
+                    Int8.into_nullable_field_ref(),
+                    vec![String::from("@a")],
+                ),
                 r#"@a"#,
             ),
             (
                 Expr::ScalarVariable(
-                    Int8,
+                    Int8.into_nullable_field_ref(),
                     vec![String::from("@root"), String::from("foo")],
                 ),
                 r#"@root.foo"#,
@@ -2169,6 +2246,20 @@ mod tests {
             (col("need-quoted").eq(lit(1)), r#"("need-quoted" = 1)"#),
             (col("need quoted").eq(lit(1)), r#"("need quoted" = 1)"#),
             // See test_interval_scalar_to_expr for interval literals
+            (
+                (col("a") + col("b")).gt(Expr::Literal(
+                    ScalarValue::Decimal32(Some(1123), 4, 3),
+                    None,
+                )),
+                r#"((a + b) > 1.123)"#,
+            ),
+            (
+                (col("a") + col("b")).gt(Expr::Literal(
+                    ScalarValue::Decimal64(Some(1123), 4, 3),
+                    None,
+                )),
+                r#"((a + b) > 1.123)"#,
+            ),
             (
                 (col("a") + col("b")).gt(Expr::Literal(
                     ScalarValue::Decimal128(Some(100123), 28, 3),
@@ -3161,6 +3252,103 @@ mod tests {
             assert_eq!(actual, expected);
         }
 
+        Ok(())
+    }
+
+    #[test]
+    fn test_cast_timestamp_sqlite() -> Result<()> {
+        let dialect: Arc<dyn Dialect> = Arc::new(SqliteDialect {});
+
+        let unparser = Unparser::new(dialect.as_ref());
+        let expr = Expr::Cast(Cast {
+            expr: Box::new(col("a")),
+            data_type: DataType::Timestamp(TimeUnit::Nanosecond, None),
+        });
+
+        let ast = unparser.expr_to_sql(&expr)?;
+
+        let actual = ast.to_string();
+        let expected = "CAST(`a` AS TEXT)".to_string();
+
+        assert_eq!(actual, expected);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_timestamp_with_tz_format() -> Result<()> {
+        let default_dialect: Arc<dyn Dialect> =
+            Arc::new(CustomDialectBuilder::new().build());
+
+        let duckdb_dialect: Arc<dyn Dialect> = Arc::new(DuckDBDialect::new());
+
+        for (dialect, scalar, expected) in [
+            (
+                Arc::clone(&default_dialect),
+                ScalarValue::TimestampSecond(Some(1757934000), Some("+00:00".into())),
+                "CAST('2025-09-15 11:00:00 +00:00' AS TIMESTAMP)",
+            ),
+            (
+                Arc::clone(&default_dialect),
+                ScalarValue::TimestampMillisecond(
+                    Some(1757934000123),
+                    Some("+01:00".into()),
+                ),
+                "CAST('2025-09-15 12:00:00.123 +01:00' AS TIMESTAMP)",
+            ),
+            (
+                Arc::clone(&default_dialect),
+                ScalarValue::TimestampMicrosecond(
+                    Some(1757934000123456),
+                    Some("-01:00".into()),
+                ),
+                "CAST('2025-09-15 10:00:00.123456 -01:00' AS TIMESTAMP)",
+            ),
+            (
+                Arc::clone(&default_dialect),
+                ScalarValue::TimestampNanosecond(
+                    Some(1757934000123456789),
+                    Some("+00:00".into()),
+                ),
+                "CAST('2025-09-15 11:00:00.123456789 +00:00' AS TIMESTAMP)",
+            ),
+            (
+                Arc::clone(&duckdb_dialect),
+                ScalarValue::TimestampSecond(Some(1757934000), Some("+00:00".into())),
+                "CAST('2025-09-15 11:00:00+00:00' AS TIMESTAMP)",
+            ),
+            (
+                Arc::clone(&duckdb_dialect),
+                ScalarValue::TimestampMillisecond(
+                    Some(1757934000123),
+                    Some("+01:00".into()),
+                ),
+                "CAST('2025-09-15 12:00:00.123+01:00' AS TIMESTAMP)",
+            ),
+            (
+                Arc::clone(&duckdb_dialect),
+                ScalarValue::TimestampMicrosecond(
+                    Some(1757934000123456),
+                    Some("-01:00".into()),
+                ),
+                "CAST('2025-09-15 10:00:00.123456-01:00' AS TIMESTAMP)",
+            ),
+            (
+                Arc::clone(&duckdb_dialect),
+                ScalarValue::TimestampNanosecond(
+                    Some(1757934000123456789),
+                    Some("+00:00".into()),
+                ),
+                "CAST('2025-09-15 11:00:00.123456789+00:00' AS TIMESTAMP)",
+            ),
+        ] {
+            let unparser = Unparser::new(dialect.as_ref());
+
+            let expr = Expr::Literal(scalar, None);
+
+            let actual = format!("{}", unparser.expr_to_sql(&expr)?);
+            assert_eq!(actual, expected);
+        }
         Ok(())
     }
 }

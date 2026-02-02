@@ -23,16 +23,18 @@ use std::collections::VecDeque;
 use std::mem::{size_of, size_of_val};
 use std::sync::Arc;
 
-use arrow::array::{new_empty_array, ArrayRef, AsArray, StructArray};
+use arrow::array::{ArrayRef, AsArray, StructArray, new_empty_array};
 use arrow::datatypes::{DataType, Field, FieldRef, Fields};
 
-use datafusion_common::utils::{get_row_at_idx, SingleRowListArrayBuilder};
-use datafusion_common::{exec_err, internal_err, not_impl_err, Result, ScalarValue};
+use datafusion_common::utils::{SingleRowListArrayBuilder, get_row_at_idx};
+use datafusion_common::{
+    Result, ScalarValue, assert_or_internal_err, exec_err, not_impl_err,
+};
 use datafusion_expr::function::{AccumulatorArgs, StateFieldsArgs};
 use datafusion_expr::utils::format_state_name;
 use datafusion_expr::{
-    lit, Accumulator, AggregateUDFImpl, Documentation, ExprFunctionExt, ReversedUDAF,
-    Signature, SortExpr, Volatility,
+    Accumulator, AggregateUDFImpl, Documentation, ExprFunctionExt, ReversedUDAF,
+    Signature, SortExpr, Volatility, lit,
 };
 use datafusion_functions_aggregate_common::merge_arrays::merge_ordered_arrays;
 use datafusion_functions_aggregate_common::utils::ordering_fields;
@@ -89,7 +91,7 @@ pub fn nth_value(
 /// Expression for a `NTH_VALUE(..., ... ORDER BY ...)` aggregation. In a multi
 /// partition setting, partial aggregations are computed for every partition,
 /// and then their results are merged.
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 pub struct NthValueAgg {
     signature: Signature,
 }
@@ -144,7 +146,7 @@ impl AggregateUDFImpl for NthValueAgg {
                     "{} not supported for n: {}",
                     self.name(),
                     &acc_args.exprs[1]
-                )
+                );
             }
         };
 
@@ -160,8 +162,8 @@ impl AggregateUDFImpl for NthValueAgg {
             .map(|e| e.expr.data_type(acc_args.schema))
             .collect::<Result<Vec<_>>>()?;
 
-        let data_type = acc_args.exprs[0].data_type(acc_args.schema)?;
-        NthValueAccumulator::try_new(n, &data_type, &ordering_dtypes, ordering)
+        let data_type = acc_args.expr_fields[0].data_type();
+        NthValueAccumulator::try_new(n, data_type, &ordering_dtypes, ordering)
             .map(|acc| Box::new(acc) as _)
     }
 
@@ -206,10 +208,11 @@ impl TrivialNthValueAccumulator {
     /// Create a new order-insensitive NTH_VALUE accumulator based on the given
     /// item data type.
     pub fn try_new(n: i64, datatype: &DataType) -> Result<Self> {
-        if n == 0 {
-            // n cannot be 0
-            return internal_err!("Nth value indices are 1 based. 0 is invalid index");
-        }
+        // n cannot be 0
+        assert_or_internal_err!(
+            n != 0,
+            "Nth value indices are 1 based. 0 is invalid index"
+        );
         Ok(Self {
             n,
             values: VecDeque::new(),
@@ -267,7 +270,7 @@ impl Accumulator for TrivialNthValueAccumulator {
             // First entry in the state is the aggregation result.
             let n_required = self.n.unsigned_abs() as usize;
             let array_agg_res = ScalarValue::convert_array_to_scalar_vec(&states[0])?;
-            for v in array_agg_res.into_iter() {
+            for v in array_agg_res.into_iter().flatten() {
                 self.values.extend(v);
                 if self.values.len() > n_required {
                     // There is enough data collected, can stop merging:
@@ -339,10 +342,11 @@ impl NthValueAccumulator {
         ordering_dtypes: &[DataType],
         ordering_req: LexOrdering,
     ) -> Result<Self> {
-        if n == 0 {
-            // n cannot be 0
-            return internal_err!("Nth value indices are 1 based. 0 is invalid index");
-        }
+        // n cannot be 0
+        assert_or_internal_err!(
+            n != 0,
+            "Nth value indices are 1 based. 0 is invalid index"
+        );
         let mut datatypes = vec![datatype.clone()];
         datatypes.extend(ordering_dtypes.iter().cloned());
         Ok(Self {
@@ -457,14 +461,14 @@ impl Accumulator for NthValueAccumulator {
         let mut partition_values = vec![self.values.clone()];
         // First entry in the state is the aggregation result.
         let array_agg_res = ScalarValue::convert_array_to_scalar_vec(&states[0])?;
-        for v in array_agg_res.into_iter() {
+        for v in array_agg_res.into_iter().flatten() {
             partition_values.push(v.into());
         }
         // Stores ordering requirement expression results coming from each partition:
         let mut partition_ordering_values = vec![self.ordering_values.clone()];
         let orderings = ScalarValue::convert_array_to_scalar_vec(agg_orderings)?;
         // Extract value from struct to ordering_rows for each group/partition:
-        for partition_ordering_rows in orderings.into_iter() {
+        for partition_ordering_rows in orderings.into_iter().flatten() {
             let ordering_values = partition_ordering_rows.into_iter().map(|ordering_row| {
                 let ScalarValue::Struct(s_array) = ordering_row else {
                     return exec_err!(

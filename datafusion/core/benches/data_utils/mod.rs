@@ -18,9 +18,9 @@
 //! This module provides the in-memory table for more realistic benchmarking.
 
 use arrow::array::{
-    builder::{Int64Builder, StringBuilder},
     ArrayRef, Float32Array, Float64Array, RecordBatch, StringArray, StringViewBuilder,
     UInt64Array,
+    builder::{Int64Builder, StringBuilder},
 };
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::datasource::MemTable;
@@ -36,6 +36,7 @@ use std::sync::Arc;
 
 /// create an in-memory table given the partition len, array len, and batch size,
 /// and the result table will be of array_len in total, and then partitioned, and batched.
+#[expect(clippy::allow_attributes)] // some issue where expect(dead_code) doesn't fire properly
 #[allow(dead_code)]
 pub fn create_table_provider(
     partitions_len: usize,
@@ -81,10 +82,11 @@ fn create_data(size: usize, null_density: f64) -> Vec<Option<f64>> {
         .collect()
 }
 
-fn create_integer_data(size: usize, value_density: f64) -> Vec<Option<u64>> {
-    // use random numbers to avoid spurious compiler optimizations wrt to branching
-    let mut rng = StdRng::seed_from_u64(42);
-
+fn create_integer_data(
+    rng: &mut StdRng,
+    size: usize,
+    value_density: f64,
+) -> Vec<Option<u64>> {
     (0..size)
         .map(|_| {
             if rng.random::<f64>() > value_density {
@@ -116,7 +118,7 @@ fn create_record_batch(
     let values = create_data(batch_size, 0.5);
 
     // Integer values between [0, u64::MAX].
-    let integer_values_wide = create_integer_data(batch_size, 9.0);
+    let integer_values_wide = create_integer_data(rng, batch_size, 9.0);
 
     // Integer values between [0, 9].
     let integer_values_narrow = (0..batch_size)
@@ -138,6 +140,7 @@ fn create_record_batch(
 
 /// Create record batches of `partitions_len` partitions and `batch_size` for each batch,
 /// with a total number of `array_len` records
+#[expect(clippy::needless_pass_by_value)]
 pub fn create_record_batches(
     schema: SchemaRef,
     array_len: usize,
@@ -181,6 +184,7 @@ impl TraceIdBuilder {
 
 /// Create time series data with `partition_cnt` partitions and `sample_cnt` rows per partition
 /// in ascending order, if `asc` is true, otherwise randomly sampled using a Pareto distribution
+#[expect(clippy::allow_attributes)] // some issue where expect(dead_code) doesn't fire properly
 #[allow(dead_code)]
 pub(crate) fn make_data(
     partition_cnt: i32,

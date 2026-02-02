@@ -24,15 +24,15 @@ use std::sync::Arc;
 
 use arrow::array::{ArrayRef, RecordBatch, UInt64Array};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
-use datafusion_common::{internal_err, Result};
+use datafusion_common::{Result, assert_eq_or_internal_err};
 use datafusion_execution::TaskContext;
 use datafusion_physical_expr::{Distribution, EquivalenceProperties};
 use datafusion_physical_expr_common::sort_expr::{LexRequirement, OrderingRequirements};
 use datafusion_physical_plan::metrics::MetricsSet;
 use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion_physical_plan::{
-    execute_input_stream, DisplayAs, DisplayFormatType, ExecutionPlan,
-    ExecutionPlanProperties, Partitioning, PlanProperties, SendableRecordBatchStream,
+    DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties, Partitioning,
+    PlanProperties, SendableRecordBatchStream, execute_input_stream,
 };
 
 use async_trait::async_trait;
@@ -46,7 +46,7 @@ use futures::StreamExt;
 /// output.
 #[async_trait]
 pub trait DataSink: DisplayAs + Debug + Send + Sync {
-    /// Returns the data sink as [`Any`](std::any::Any) so that it can be
+    /// Returns the data sink as [`Any`] so that it can be
     /// downcast to a specific implementation.
     fn as_any(&self) -> &dyn Any;
 
@@ -94,12 +94,17 @@ pub struct DataSinkExec {
 
 impl Debug for DataSinkExec {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "DataSinkExec schema: {:?}", self.count_schema)
+        write!(f, "DataSinkExec schema: {}", self.count_schema)
     }
 }
 
 impl DataSinkExec {
     /// Create a plan to write to `sink`
+    /// Note: DataSinkExec requires its input to have a single partition.
+    /// If the input has multiple partitions, the physical optimizer will
+    /// automatically insert a Merge-related operator to merge them.
+    /// If you construct PhysicalPlan without going through the physical optimizer,
+    /// you must ensure that the input has a single partition.
     pub fn new(
         input: Arc<dyn ExecutionPlan>,
         sink: Arc<dyn DataSink>,
@@ -221,9 +226,11 @@ impl ExecutionPlan for DataSinkExec {
         partition: usize,
         context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
-        if partition != 0 {
-            return internal_err!("DataSinkExec can only be called on partition 0!");
-        }
+        assert_eq_or_internal_err!(
+            partition,
+            0,
+            "DataSinkExec can only be called on partition 0!"
+        );
         let data = execute_input_stream(
             Arc::clone(&self.input),
             Arc::clone(self.sink.schema()),
