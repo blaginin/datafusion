@@ -60,12 +60,13 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           ref: ${{ github.event.inputs.pr_head_sha }} # otherwise use the event's commit, including the merge group
+          submodules: ${{ vars.USE_RUNS_ON != 'true' }}
           fetch-depth: 1
       - name: Checkout test data
-        if: hashFiles('.github/actions/checkout-test-data/action.yaml') != ''
+        if: vars.USE_RUNS_ON == 'true' && hashFiles('.github/actions/checkout-test-data/action.yaml') != ''
         uses: ./.github/actions/checkout-test-data
       - name: Checkout test data for older revisions
-        if: hashFiles('.github/actions/checkout-test-data/action.yaml') == ''
+        if: vars.USE_RUNS_ON == 'true' && hashFiles('.github/actions/checkout-test-data/action.yaml') == ''
         run: |
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
           git submodule sync -- testing parquet-testing
