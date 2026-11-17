@@ -3,21 +3,36 @@
 // SPDX-FileContributor: Licensed to the Apache Software Foundation (ASF) under one or more contributor license agreements
 
 use crate::PhysicalExpr;
+use crate::expressions::Literal;
+use arrow::array::{AsArray, BooleanArray};
 use arrow::datatypes::{DataType, Schema};
 use arrow::record_batch::RecordBatch;
-use datafusion_common::{Result, assert_or_internal_err};
+use datafusion_common::{Result, ScalarValue, assert_or_internal_err};
 use datafusion_expr::{ColumnarValue, Operator};
 use datafusion_physical_expr_common::datum::apply_cmp;
+use regex::{Regex, RegexBuilder};
+use std::fmt;
 use std::hash::Hash;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 // Like expression
-#[derive(Debug, Eq)]
 pub struct LikeExpr {
     negated: bool,
     case_insensitive: bool,
     expr: Arc<dyn PhysicalExpr>,
     pattern: Arc<dyn PhysicalExpr>,
+    literal_regex: OnceLock<Option<Box<(DataType, Regex)>>>,
+}
+
+impl fmt::Debug for LikeExpr {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("LikeExpr")
+            .field("negated", &self.negated)
+            .field("case_insensitive", &self.case_insensitive)
+            .field("expr", &self.expr)
+            .field("pattern", &self.pattern)
+            .finish()
+    }
 }
 
 // Manually derive PartialEq and Hash to work around https://github.com/rust-lang/rust/issues/78808
@@ -29,6 +44,8 @@ impl PartialEq for LikeExpr {
             && self.pattern.eq(&other.pattern)
     }
 }
+
+impl Eq for LikeExpr {}
 
 impl Hash for LikeExpr {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
@@ -51,7 +68,25 @@ impl LikeExpr {
             case_insensitive,
             expr,
             pattern,
+            literal_regex: OnceLock::new(),
         }
+    }
+
+    fn literal_regex(&self) -> Option<&(DataType, Regex)> {
+        self.literal_regex
+            .get_or_init(|| {
+                let value = self.pattern.downcast_ref::<Literal>()?.value();
+                let (data_type, pattern) = match value {
+                    ScalarValue::Utf8(Some(pattern)) => (DataType::Utf8, pattern),
+                    ScalarValue::LargeUtf8(Some(pattern)) => {
+                        (DataType::LargeUtf8, pattern)
+                    }
+                    ScalarValue::Utf8View(Some(pattern)) => (DataType::Utf8View, pattern),
+                    _ => return None,
+                };
+                Some(Box::new((data_type, compile_like_regex(pattern)?)))
+            })
+            .as_deref()
     }
 
     /// Is negated
@@ -85,8 +120,8 @@ impl LikeExpr {
     }
 }
 
-impl std::fmt::Display for LikeExpr {
-    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+impl fmt::Display for LikeExpr {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "{} {} {}", self.expr, self.op_name(), self.pattern)
     }
 }
@@ -102,6 +137,30 @@ impl PhysicalExpr for LikeExpr {
 
     fn evaluate(&self, batch: &RecordBatch) -> Result<ColumnarValue> {
         let lhs = self.expr.evaluate(batch)?;
+        if !self.case_insensitive
+            && let ColumnarValue::Array(array) = &lhs
+            && matches!(
+                array.data_type(),
+                DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View
+            )
+            && let Some((data_type, regex)) = self.literal_regex()
+            && array.data_type() == data_type
+        {
+            let matches = |value: &str| regex.is_match(value) != self.negated;
+            let result = match data_type {
+                DataType::Utf8 => {
+                    BooleanArray::from_unary(array.as_string::<i32>(), matches)
+                }
+                DataType::LargeUtf8 => {
+                    BooleanArray::from_unary(array.as_string::<i64>(), matches)
+                }
+                DataType::Utf8View => {
+                    BooleanArray::from_unary(array.as_string_view(), matches)
+                }
+                _ => unreachable!(),
+            };
+            return Ok(ColumnarValue::Array(Arc::new(result)));
+        }
         let rhs = self.pattern.evaluate(batch)?;
         match (self.negated, self.case_insensitive) {
             (false, false) => apply_cmp(Operator::LikeMatch, &lhs, &rhs),
@@ -127,7 +186,7 @@ impl PhysicalExpr for LikeExpr {
         )))
     }
 
-    fn fmt_sql(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt_sql(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.expr.fmt_sql(f)?;
         write!(f, " {} ", self.op_name())?;
         self.pattern.fmt_sql(f)
@@ -145,6 +204,7 @@ impl PhysicalExpr for LikeExpr {
             case_insensitive,
             expr,
             pattern,
+            ..
         } = self;
 
         Ok(Some(protobuf::PhysicalExprNode {
@@ -199,6 +259,35 @@ impl LikeExpr {
     }
 }
 
+fn compile_like_regex(pattern: &str) -> Option<Regex> {
+    let body = pattern.strip_prefix('%').unwrap_or(pattern);
+    let body = body.strip_suffix('%').unwrap_or(body);
+    // Leave SQL escapes and Arrow's equality, prefix, suffix, and substring kernels to Arrow.
+    if pattern.contains('\\') || !body.contains(['%', '_']) {
+        return None;
+    }
+
+    let mut source = String::new();
+    if !pattern.starts_with('%') {
+        source.push('^');
+    }
+    let mut start = 0;
+    for (index, wildcard) in body.match_indices(['%', '_']) {
+        source.push_str(&regex::escape(&body[start..index]));
+        source.push_str(if wildcard == "%" { ".*" } else { "." });
+        start = index + 1;
+    }
+    source.push_str(&regex::escape(&body[start..]));
+    if !pattern.ends_with('%') {
+        source.push('$');
+    }
+    // Arrow reports the usual pattern error if the builder rejects this regex.
+    RegexBuilder::new(&source)
+        .dot_matches_new_line(true)
+        .build()
+        .ok()
+}
+
 /// used for optimize Dictionary like
 fn can_like_type(from_type: &DataType) -> bool {
     match from_type {
@@ -232,8 +321,9 @@ pub fn like(
 #[cfg(test)]
 mod test {
     use super::*;
-    use crate::expressions::col;
+    use crate::expressions::{col, lit};
     use arrow::array::*;
+    use arrow::compute::cast;
     use arrow::datatypes::Field;
     use datafusion_common::cast::as_boolean_array;
     use datafusion_physical_expr_common::physical_expr::fmt_sql;
@@ -306,6 +396,69 @@ mod test {
             true,
         ); // not ilike
 
+        Ok(())
+    }
+
+    #[test]
+    fn literal_like_matches_arrow_across_batches() -> Result<()> {
+        let input = StringArray::from(vec![
+            Some("p\n"),
+            Some("p雪"),
+            Some("pe\u{0301}"),
+            Some("p"),
+            Some("p.b\nz"),
+            Some("p_z"),
+            Some("abc.z\n"),
+            Some(""),
+            None,
+        ]);
+        for data_type in [DataType::Utf8, DataType::LargeUtf8, DataType::Utf8View] {
+            let schema =
+                Arc::new(Schema::new(vec![Field::new("s", data_type.clone(), true)]));
+            let batch = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![cast(&input, &data_type)?],
+            )?;
+            for (negated, op) in
+                [(false, Operator::LikeMatch), (true, Operator::NotLikeMatch)]
+            {
+                for pattern in [
+                    Some("p_"),
+                    Some("p%z"),
+                    Some("%.z_%"),
+                    Some("p%%"),
+                    Some("%p%"),
+                    Some(r"p\_%"),
+                    None,
+                ] {
+                    let literal = ScalarValue::Utf8(pattern.map(str::to_owned))
+                        .cast_to(&data_type)?;
+                    let expression = like(
+                        negated,
+                        false,
+                        col("s", &schema)?,
+                        lit(literal.clone()),
+                        &schema,
+                    )?;
+                    for batch in [batch.slice(0, 0), batch.slice(0, 4), batch.slice(4, 5)]
+                    {
+                        let expected = apply_cmp(
+                            op,
+                            &ColumnarValue::Array(Arc::clone(batch.column(0))),
+                            &ColumnarValue::Scalar(literal.clone()),
+                        )?;
+                        let actual =
+                            expression.evaluate(&batch)?.into_array(batch.num_rows())?;
+                        let expected = expected.into_array(batch.num_rows())?;
+                        assert_eq!(
+                            actual.as_ref(),
+                            expected.as_ref(),
+                            "{op:?} {pattern:?} on {data_type}"
+                        );
+                    }
+                }
+            }
+        }
         Ok(())
     }
 
